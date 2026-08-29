@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kedi Notebook</title>
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap"
+    />
+    <link rel="stylesheet" href="/notebook/notebook.css" />
+    <script src="/vendor/lucide.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs/loader.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand" aria-label="Kedi Notebook">
+        <span class="brand-mark" aria-hidden="true">/\_/\</span>
+        <span class="brand-name">Kedi</span>
+        <span class="brand-section">Notebook</span>
+      </div>
+      <div class="document-title">
+        <input id="notebook-title" value="Untitled notebook" aria-label="Notebook title" />
+        <span id="save-state" class="save-state">Local</span>
+      </div>
+      <nav class="topbar-actions" aria-label="Notebook actions">
+        <button id="new-notebook" class="icon-button" type="button" title="New notebook" aria-label="New notebook">
+          <i data-lucide="file-plus-2"></i>
+        </button>
+        <button id="open-notebook" class="icon-button" type="button" title="Open notebook" aria-label="Open notebook">
+          <i data-lucide="folder-open"></i>
+        </button>
+        <button id="save-notebook" class="icon-button" type="button" title="Save notebook" aria-label="Save notebook">
+          <i data-lucide="download"></i>
+        </button>
+        <button id="theme-toggle" class="icon-button" type="button" title="Toggle theme" aria-label="Toggle theme">
+          <i data-lucide="sun"></i>
+        </button>
+      </nav>
+    </header>
+
+    <div class="command-strip">
+      <div class="command-inner">
+        <div class="add-cell-control">
+          <button id="add-cell" class="command-button" type="button">
+            <i data-lucide="plus"></i>
+            <span>Add cell</span>
+          </button>
+          <select id="cell-kind" aria-label="New cell type">
+            <option value="kedi">Kedi</option>
+            <option value="terminal">Terminal</option>
+            <option value="markdown">Markdown</option>
+          </select>
+        </div>
+        <div class="runtime-control">
+          <span id="runtime-status" class="runtime-status" aria-live="polite">
+            <span class="status-dot"></span>
+            <span>Ready</span>
+          </span>
+          <label for="runtime-select">Runtime</label>
+          <select id="runtime-select" aria-label="Execution runtime">
+            <option value="browser">Browser - Pyodide 3.14</option>
+          </select>
+          <button id="reset-session" class="icon-button compact" type="button" title="Start a new runtime session" aria-label="Start a new runtime session">
+            <i data-lucide="rotate-ccw"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <main class="notebook-shell">
+      <section id="cells" class="cells" aria-label="Notebook cells"></section>
+      <button id="append-cell" class="append-cell" type="button">
+        <i data-lucide="plus"></i>
+        <span>Add cell</span>
+      </button>
+    </main>
+
+    <input id="notebook-file" type="file" accept=".kedinb,.json,application/json" hidden />
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <script type="module" src="/notebook/notebook.js"></script>
+  </body>
+</html>
