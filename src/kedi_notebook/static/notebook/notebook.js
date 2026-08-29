@@ -114,7 +114,6 @@ function addCell(kind, source) {
     kind,
     source,
     status: "draft",
-    executionCount: null,
     stdout: "",
     result: null,
     error: null,
@@ -130,15 +129,15 @@ async function render() {
   disposeEditor();
   ui.title.value = state.title;
   ui.cells.replaceChildren();
-  for (const cell of state.cells) {
-    ui.cells.append(await renderCell(cell));
+  for (const [cellPosition, cell] of state.cells.entries()) {
+    ui.cells.append(await renderCell(cell, cellPosition + 1));
   }
   ui.runtime.value = state.runtime;
   ui.runtime.disabled = Boolean(state.sessionId);
   globalThis.lucide?.createIcons();
 }
 
-async function renderCell(cell) {
+async function renderCell(cell, cellNumber) {
   const active = cell.id === state.activeCellId;
   const article = document.createElement("article");
   article.className = `cell ${cell.status}${active ? " active" : ""}`;
@@ -146,7 +145,7 @@ async function renderCell(cell) {
 
   const index = document.createElement("span");
   index.className = `cell-index${cell.status === "success" ? " success" : ""}`;
-  index.textContent = cell.executionCount ? `[${cell.executionCount}]` : "[ ]";
+  index.textContent = `[${cellNumber}]`;
   article.append(index);
 
   const heading = document.createElement("div");
@@ -355,7 +354,6 @@ async function runCell(cellId) {
         ? await fetchTerminalStream(endpoint, request, cell)
         : await fetchJson(endpoint, request);
     cell.status = "success";
-    cell.executionCount = payload.executionCount;
     cell.stdout = payload.stdout || "";
     cell.result = payload.result;
     state.activeCellId = cell.id;
@@ -525,7 +523,6 @@ async function resetRuntimeSession() {
   for (const cell of state.cells) {
     if (cell.kind !== "markdown") {
       cell.status = "draft";
-      cell.executionCount = null;
       cell.stdout = "";
       cell.result = null;
       cell.error = null;
@@ -588,7 +585,6 @@ async function openNotebookFile() {
       kind: normalizeCellKind(cell.kind),
       source: typeof cell.source === "string" ? cell.source : "",
       status: "draft",
-      executionCount: null,
       stdout: "",
       result: null,
       error: null,
@@ -760,7 +756,6 @@ function restoreDraft() {
       kind: normalizeCellKind(cell.kind),
       source: typeof cell.source === "string" ? cell.source : "",
       status: "draft",
-      executionCount: null,
       stdout: "",
       result: null,
       error: null,

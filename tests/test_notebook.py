@@ -262,8 +262,12 @@ def test_notebook_static_route_serves_notebook_ui(tmp_path: Path) -> None:
 
     with TestClient(app) as client:
         response = client.get("/notebook/")
+        script = client.get("/notebook/notebook.js")
 
     assert response.status_code == 200
     assert "Kedi Notebook" in response.text
     assert 'id="runtime-select"' in response.text
     assert '<option value="terminal">Terminal</option>' in response.text
+    assert script.status_code == 200
+    assert "renderCell(cell, cellPosition + 1)" in script.text
+    assert "cell.executionCount" not in script.text

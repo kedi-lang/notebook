@@ -52,3 +52,5 @@ Browser mode supports `!pip install`, `!uv add`, `!pip list`, `!echo`, and
 
 Notebook execution is non-transactional. Rerunning a cell is a new execution
 attempt against current state; it does not roll back previous side effects.
+Displayed cell numbers follow notebook order and remain unchanged across
+reruns. Adding, moving, or deleting cells recomputes affected positions.
