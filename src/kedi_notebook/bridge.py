@@ -7,6 +7,8 @@ from threading import Condition, Lock
 from typing import Any
 from uuid import uuid4
 
+_MAX_OUTPUT_CHARS = 200_000
+
 
 class BridgeCancelled(RuntimeError):
     pass
@@ -20,6 +22,7 @@ class BridgeRun:
         self.waiting: set[str] = set()
         self.responses: dict[str, dict[str, Any]] = {}
         self.output_events: dict[str, deque[dict[str, str]]] = {}
+        self.output_sizes: dict[str, int] = {}
         self.done = False
         self.cancelled = False
         self.updated_at = time.monotonic()
@@ -46,6 +49,7 @@ class BridgeRun:
             self.pending.append(request)
             self.waiting.add(request_id)
             self.output_events[request_id] = deque()
+            self.output_sizes[request_id] = 0
             self.updated_at = time.monotonic()
             self.condition.notify_all()
         deadline = time.monotonic() + timeout
@@ -75,6 +79,7 @@ class BridgeRun:
                 self.waiting.discard(request_id)
                 self.responses.pop(request_id, None)
                 self.output_events.pop(request_id, None)
+                self.output_sizes.pop(request_id, None)
 
     def next_request(self, *, timeout: float) -> dict[str, Any] | None:
         with self.condition:
@@ -105,6 +110,11 @@ class BridgeRun:
                 raise ValueError("Bridge output stream must be stdout or stderr")
             if not text:
                 return
+            remaining = _MAX_OUTPUT_CHARS - self.output_sizes[request_id]
+            if remaining <= 0:
+                return
+            text = text[:remaining]
+            self.output_sizes[request_id] += len(text)
             self.output_events[request_id].append(
                 {"type": "output", "stream": stream, "text": text}
             )

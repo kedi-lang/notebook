@@ -1,4 +1,6 @@
-import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v314.0.2/full/pyodide.mjs";
+import { loadPyodide } from "./vendor/pyodide/pyodide.mjs";
+
+const PYODIDE_INDEX_URL = new URL("./vendor/pyodide/", import.meta.url).href;
 
 const pyodidePromise = initializePyodide();
 void pyodidePromise.then(
@@ -130,7 +132,7 @@ json.dumps(__kedi_terminal_response)
 
 async function initializePyodide() {
   self.postMessage({ type: "status", message: "Loading Python runtime" });
-  const pyodide = await loadPyodide();
+  const pyodide = await loadPyodide({ indexURL: PYODIDE_INDEX_URL });
   self.postMessage({ type: "status", message: "Loading Pydantic" });
   await pyodide.loadPackage(["micropip", "pydantic"]);
   pyodide.runPython(DRIVER_SETUP);

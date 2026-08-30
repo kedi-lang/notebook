@@ -3,14 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
     <title>Kedi Notebook</title>
+    <link rel="icon" href="data:," />
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap"
-    />
     <link rel="stylesheet" href="/notebook/notebook.css" />
     <script src="/vendor/lucide.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs/loader.js"></script>
@@ -23,10 +19,14 @@
         <span class="brand-section">Notebook</span>
       </div>
       <div class="document-title">
-        <input id="notebook-title" value="Untitled notebook" aria-label="Notebook title" />
+        <input id="notebook-title" value="Untitled notebook" maxlength="200" aria-label="Notebook title" />
         <span id="save-state" class="save-state">Local</span>
       </div>
       <nav class="topbar-actions" aria-label="Notebook actions">
+        <button id="manage-secrets" class="command-button topbar-command" type="button">
+          <i data-lucide="key-round"></i>
+          <span>Secret Manager</span>
+        </button>
         <button id="new-notebook" class="icon-button" type="button" title="New notebook" aria-label="New notebook">
           <i data-lucide="file-plus-2"></i>
         </button>
@@ -35,9 +35,6 @@
         </button>
         <button id="save-notebook" class="icon-button" type="button" title="Save notebook" aria-label="Save notebook">
           <i data-lucide="download"></i>
-        </button>
-        <button id="theme-toggle" class="icon-button" type="button" title="Toggle theme" aria-label="Toggle theme">
-          <i data-lucide="sun"></i>
         </button>
       </nav>
     </header>
@@ -64,8 +61,14 @@
           <select id="runtime-select" aria-label="Execution runtime">
             <option value="browser">Browser - Pyodide 3.14</option>
           </select>
+          <button id="manage-packages" class="icon-button compact" type="button" title="Manage host packages" aria-label="Manage host packages" hidden>
+            <i data-lucide="package-plus"></i>
+          </button>
           <button id="reset-session" class="icon-button compact" type="button" title="Start a new runtime session" aria-label="Start a new runtime session">
             <i data-lucide="rotate-ccw"></i>
+          </button>
+          <button id="interrupt-session" class="icon-button compact danger-action" type="button" title="Interrupt execution" aria-label="Interrupt execution" hidden>
+            <i data-lucide="square"></i>
           </button>
         </div>
       </div>
@@ -81,6 +84,106 @@
 
     <input id="notebook-file" type="file" accept=".kedinb,.json,application/json" hidden />
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <dialog id="package-dialog" class="package-dialog" aria-labelledby="package-dialog-title">
+      <div class="dialog-heading">
+        <div>
+          <h2 id="package-dialog-title">Host packages</h2>
+          <p id="package-environment" class="environment-path"></p>
+        </div>
+        <button id="close-packages" class="icon-button compact" type="button" title="Close" aria-label="Close package manager">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <form id="package-form" class="package-form">
+        <textarea id="package-requirements" rows="3" maxlength="15000" placeholder="httpx&#10;pydantic>=2" aria-label="Package requirements, one per line"></textarea>
+        <button id="install-packages" class="command-button" type="submit">
+          <i data-lucide="download"></i>
+          <span>Install</span>
+        </button>
+      </form>
+      <pre id="package-output" class="package-output" aria-live="polite" hidden></pre>
+      <div class="package-list-heading">
+        <span>Installed</span>
+        <button id="refresh-packages" class="icon-button compact" type="button" title="Refresh packages" aria-label="Refresh packages">
+          <i data-lucide="refresh-cw"></i>
+        </button>
+      </div>
+      <div id="package-list" class="package-list" aria-live="polite"></div>
+    </dialog>
+
+    <dialog id="secret-dialog" class="package-dialog secret-dialog" aria-labelledby="secret-dialog-title">
+      <div class="dialog-heading">
+        <div>
+          <h2 id="secret-dialog-title">Secret Manager</h2>
+          <p class="dialog-description">Environment values stay on this computer and are never saved in the notebook.</p>
+        </div>
+        <button id="close-secrets" class="icon-button compact" type="button" title="Close" aria-label="Close Secret Manager">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <form id="secret-form" class="secret-form">
+        <label>
+          <span>Name</span>
+          <input id="secret-name" name="name" maxlength="200" autocomplete="off" spellcheck="false" placeholder="OPENROUTER_API_KEY" required />
+        </label>
+        <label>
+          <span>Value</span>
+          <input id="secret-value" name="value" type="password" maxlength="128000" autocomplete="new-password" placeholder="Stored locally" required />
+        </label>
+        <button id="save-secret" class="command-button" type="submit">
+          <i data-lucide="save"></i>
+          <span>Save</span>
+        </button>
+      </form>
+      <form id="dotenv-form" class="dotenv-form">
+        <label for="dotenv-path">Import from .env path</label>
+        <div class="dotenv-row">
+          <input id="dotenv-path" maxlength="4096" autocomplete="off" spellcheck="false" placeholder=".env or ~/project/.env" required />
+          <button id="import-dotenv" class="command-button" type="submit">
+            <i data-lucide="file-input"></i>
+            <span>Import</span>
+          </button>
+        </div>
+      </form>
+      <div class="secret-list-heading">
+        <span>Configured environment values</span>
+        <span id="secret-count">0</span>
+      </div>
+      <div id="secret-list" class="secret-list" aria-live="polite"></div>
+      <p class="secret-footnote">Saving, importing, or deleting values starts a fresh runtime session.</p>
+    </dialog>
+
+    <dialog id="save-dialog" class="package-dialog save-dialog" aria-labelledby="save-dialog-title">
+      <div class="dialog-heading">
+        <div>
+          <h2 id="save-dialog-title">Download notebook</h2>
+          <p class="dialog-description">Choose what the `.kedinb` file should contain.</p>
+        </div>
+        <button id="close-save-dialog" class="icon-button compact" type="button" title="Close" aria-label="Close download options">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="save-options">
+        <button id="save-progress" class="save-option" type="button">
+          <i data-lucide="archive"></i>
+          <span class="save-option-copy">
+            <strong>Save progress</strong>
+            <span>Include cell outputs, execution results, and restorable Kedi session state.</span>
+            <small>Secret Manager values are never included.</small>
+          </span>
+          <i data-lucide="chevron-right"></i>
+        </button>
+        <button id="save-just-notebook" class="save-option" type="button">
+          <i data-lucide="notebook-tabs"></i>
+          <span class="save-option-copy">
+            <strong>Just notebook</strong>
+            <span>Include cell sources and layout only, without outputs or environment values.</span>
+          </span>
+          <i data-lucide="chevron-right"></i>
+        </button>
+      </div>
+    </dialog>
 
     <script type="module" src="/notebook/notebook.js"></script>
   </body>

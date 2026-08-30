@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import codecs
 import json
 import os
@@ -8,8 +10,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -21,8 +25,9 @@ from uuid import uuid4
 import kedi
 from kedi.executors import PlaygroundExecutor, PyodideExecutor
 
-from .bridge import BridgeRun
+from .bridge import BridgeCancelled, BridgeRun
 from .execution import execution_error_payload
+from .host_environment import HostEnvironmentManager, HostEnvironmentProvider
 
 _RESPONSE_PREFIX = "__KEDI_NOTEBOOK_RESPONSE__"
 _WORKER = Path(__file__).with_name("sandbox_worker.py")
@@ -34,6 +39,13 @@ _COMMON_PYTHON_DIRS = (
 )
 _PYTHON_BINARY_NAME = re.compile(r"python(?:3(?:\.\d+)?)?")
 _TERMINAL_TIMEOUT = 120.0
+_PACKAGE_INSTALL_TIMEOUT = 600.0
+_EXECUTION_TIMEOUT = 120.0
+_OUTPUT_LIMIT = 200_000
+
+
+def _notebook_source_name(session_id: str, attempt: int) -> str:
+    return f"<notebook:{session_id[:8]}:{attempt}>"
 
 
 @dataclass(frozen=True)
@@ -44,6 +56,9 @@ class HostPython:
     label: str
     current: bool = False
     explicit: bool = False
+    managed: bool = False
+    base_executable: str | None = None
+    environment: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -53,7 +68,8 @@ class HostPythonBridge:
     """Persistent Python executor bridge running under a selected interpreter."""
 
     def __init__(self, executable: str, *, cwd: Path) -> None:
-        self._lock = threading.Lock()
+        self._request_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._closed = False
         self._process = subprocess.Popen(
             [executable, "-u", str(_WORKER)],
@@ -65,46 +81,85 @@ class HostPythonBridge:
             cwd=cwd,
             env=os.environ.copy(),
         )
+        self._stderr: deque[str] = deque(maxlen=200)
+        self._stderr_reader = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_reader.start()
 
     def request(self, payload: Mapping[str, Any], *, timeout: float) -> Mapping[str, Any]:
-        del timeout  # The line protocol is serialized; cancellation closes the worker.
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Host Python worker is closed")
-            process = self._process
+        with self._request_lock:
+            with self._state_lock:
+                if self._closed:
+                    raise BridgeCancelled("Host Python worker was interrupted")
+                process = self._process
             if process.stdin is None or process.stdout is None:
                 raise RuntimeError("Host Python worker pipes are unavailable")
+            stdout = process.stdout
             if process.poll() is not None:
                 raise RuntimeError(self._worker_error("Host Python worker exited"))
             process.stdin.write(json.dumps(dict(payload), separators=(",", ":")) + "\n")
             process.stdin.flush()
-            for line in process.stdout:
-                if line.startswith(_RESPONSE_PREFIX):
-                    response = json.loads(line.removeprefix(_RESPONSE_PREFIX))
-                    if not isinstance(response, dict):
-                        raise TypeError("Host Python worker response must be an object")
-                    return response
-            raise RuntimeError(self._worker_error("Host Python worker returned no response"))
+            response_queue: Queue[tuple[str, str | BaseException | None]] = Queue(maxsize=1)
+
+            def read_response() -> None:
+                try:
+                    for line in stdout:
+                        if line.startswith(_RESPONSE_PREFIX):
+                            response_queue.put(("response", line.removeprefix(_RESPONSE_PREFIX)))
+                            return
+                    response_queue.put(("closed", None))
+                except BaseException as exc:  # Worker pipe boundary.
+                    response_queue.put(("error", exc))
+
+            reader = threading.Thread(target=read_response, daemon=True)
+            reader.start()
+            try:
+                kind, value = response_queue.get(timeout=timeout)
+            except Empty:
+                self._terminate_process(process)
+                reader.join(timeout=1)
+                raise TimeoutError(f"Host Python execution exceeded {timeout:g} seconds") from None
+            if kind == "error":
+                if isinstance(value, BaseException):
+                    raise RuntimeError("Host Python worker response failed") from value
+                raise RuntimeError("Host Python worker response failed")
+            if kind == "closed":
+                with self._state_lock:
+                    interrupted = self._closed
+                if interrupted:
+                    raise BridgeCancelled("Host Python worker was interrupted")
+                raise RuntimeError(self._worker_error("Host Python worker returned no response"))
+            response = json.loads(str(value))
+            if not isinstance(response, dict):
+                raise TypeError("Host Python worker response must be an object")
+            return response
 
     def close(self) -> None:
-        with self._lock:
+        with self._state_lock:
             if self._closed:
                 return
             self._closed = True
             process = self._process
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
+        self._terminate_process(process)
+
+    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+
+    def _drain_stderr(self) -> None:
+        stderr = self._process.stderr
+        if stderr is None:
+            return
+        for line in stderr:
+            self._stderr.append(line.rstrip())
 
     def _worker_error(self, fallback: str) -> str:
-        stderr = self._process.stderr
-        detail = (
-            stderr.read().strip() if stderr is not None and self._process.poll() is not None else ""
-        )
+        detail = "\n".join(self._stderr).strip()
         return detail or fallback
 
 
@@ -116,6 +171,8 @@ class NotebookSession:
         mode: Literal["browser", "host"],
         cwd: Path,
         python: HostPython | None,
+        interactive_options: Mapping[str, Any] | None = None,
+        session_snapshot: str | None = None,
     ) -> None:
         self.id = session_id
         self.mode = mode
@@ -124,25 +181,42 @@ class NotebookSession:
         self.bridge: BridgeRun | HostPythonBridge
         if mode == "browser":
             self.bridge = BridgeRun(session_id)
-            executor = PyodideExecutor(self.bridge, timeout=120)
+            executor = PyodideExecutor(self.bridge, timeout=_EXECUTION_TIMEOUT)
         else:
             if python is None:
                 raise ValueError("Host execution requires a Python interpreter")
             self.bridge = HostPythonBridge(python.executable, cwd=cwd)
-            executor = PlaygroundExecutor(self.bridge, timeout=120)
+            executor = PlaygroundExecutor(self.bridge, timeout=_EXECUTION_TIMEOUT)
         self._executor = executor
-        self._session = kedi.interactive(executor=executor, cwd=cwd)
-        self._lock = threading.Lock()
+        try:
+            if session_snapshot is None:
+                self._session = kedi.interactive(
+                    executor=executor,
+                    cwd=cwd,
+                    **dict(interactive_options or {}),
+                )
+            else:
+                self._session = _load_session_snapshot(session_snapshot, executor=executor)
+        except BaseException:
+            if isinstance(self.bridge, BridgeRun):
+                self.bridge.cancel()
+            else:
+                self.bridge.close()
+            raise
+        self._execution_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._closed = False
+        self._active_terminal_process: subprocess.Popen[bytes] | None = None
         self._attempt = 0
         self._execution_count = 0
+        self._last_activity = time.monotonic()
 
     def execute(self, *, cell_id: str, source: str) -> dict[str, Any]:
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Notebook session is closed")
+        with self._execution_lock:
+            self._assert_open()
+            self.touch()
             self._attempt += 1
-            source_name = f"<notebook:{self.id}:{cell_id}:{self._attempt}>"
+            source_name = _notebook_source_name(self.id, self._attempt)
             try:
                 result = self._session.execute(source, source_name=source_name)
             except BaseException as exc:
@@ -151,7 +225,8 @@ class NotebookSession:
                     {
                         "cellId": cell_id,
                         "attempt": self._attempt,
-                        "stdout": self._executor.drain_stdout(),
+                        "stdout": _truncate_output(self._executor.drain_stdout()),
+                        "runtimeReset": _requires_runtime_reset(exc),
                     }
                 )
                 return payload
@@ -161,7 +236,7 @@ class NotebookSession:
                 "cellId": cell_id,
                 "attempt": self._attempt,
                 "executionCount": self._execution_count,
-                "stdout": self._executor.drain_stdout(),
+                "stdout": _truncate_output(self._executor.drain_stdout()),
                 "result": _json_result(result),
             }
 
@@ -174,17 +249,26 @@ class NotebookSession:
             raise RuntimeError("Terminal execution returned no result")
         return result
 
+    def snapshot(self) -> str:
+        with self._execution_lock:
+            self._assert_open()
+            self.touch()
+            with tempfile.TemporaryDirectory(prefix="kedi-notebook-snapshot-") as directory:
+                path = Path(directory) / "session.json"
+                self._session.dump(path)
+                return base64.b64encode(path.read_bytes()).decode("ascii")
+
     def stream_terminal(
         self,
         *,
         cell_id: str,
         source: str,
     ) -> Iterator[dict[str, Any]]:
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Notebook session is closed")
+        with self._execution_lock:
+            self._assert_open()
+            self.touch()
             self._attempt += 1
-            stdout: list[str] = []
+            stdout = _BoundedText(_OUTPUT_LIMIT)
             try:
                 commands = _terminal_commands(source)
                 for command in commands:
@@ -192,7 +276,10 @@ class NotebookSession:
                         if not isinstance(self.bridge, BridgeRun):
                             raise RuntimeError("Browser terminal bridge is unavailable")
                         response: Mapping[str, Any] | None = None
-                        streamed = {"stdout": "", "stderr": ""}
+                        streamed = {
+                            "stdout": _BoundedText(_OUTPUT_LIMIT),
+                            "stderr": _BoundedText(_OUTPUT_LIMIT),
+                        }
                         for event in self.bridge.request_events(
                             {"action": "execute_terminal", "command": command},
                             timeout=_TERMINAL_TIMEOUT,
@@ -200,20 +287,21 @@ class NotebookSession:
                             if event["type"] == "output":
                                 stream = str(event["stream"])
                                 text = str(event["text"])
-                                streamed[stream] += text
-                                stdout.append(text)
-                                yield event
+                                streamed[stream].append(text)
+                                if accepted := stdout.append(text):
+                                    yield {**event, "text": accepted}
                             else:
                                 response = event["response"]
                         if response is None:
                             raise RuntimeError("Browser terminal returned no response")
                         for stream in ("stdout", "stderr"):
                             text = str(response.get(stream, ""))
-                            if text.startswith(streamed[stream]):
-                                text = text[len(streamed[stream]) :]
+                            streamed_text = streamed[stream].raw_value
+                            if text.startswith(streamed_text):
+                                text = text[len(streamed_text) :]
                             if text:
-                                stdout.append(text)
-                                yield {"type": "output", "stream": stream, "text": text}
+                                if accepted := stdout.append(text):
+                                    yield {"type": "output", "stream": stream, "text": accepted}
                         return_code = 0 if response.get("ok") is True else 1
                     else:
                         response = None
@@ -221,8 +309,8 @@ class NotebookSession:
                         for event in self._stream_host_terminal(command):
                             if event["type"] == "output":
                                 text = str(event["text"])
-                                stdout.append(text)
-                                yield event
+                                if accepted := stdout.append(text):
+                                    yield {**event, "text": accepted}
                             else:
                                 return_code = int(event["returnCode"])
                     if return_code != 0:
@@ -237,8 +325,9 @@ class NotebookSession:
                             "ok": False,
                             "cellId": cell_id,
                             "attempt": self._attempt,
-                            "stdout": "".join(stdout),
+                            "stdout": stdout.value,
                             "error": f"{error_type}: {detail}",
+                            "runtimeReset": False,
                         }
                         return
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -247,8 +336,12 @@ class NotebookSession:
                     "ok": False,
                     "cellId": cell_id,
                     "attempt": self._attempt,
-                    "stdout": "".join(stdout),
+                    "stdout": stdout.value,
                     "error": f"{type(exc).__name__}: {exc}",
+                    "runtimeReset": isinstance(
+                        exc,
+                        (BridgeCancelled, subprocess.TimeoutExpired, TimeoutError),
+                    ),
                 }
                 return
 
@@ -259,7 +352,7 @@ class NotebookSession:
                 "cellId": cell_id,
                 "attempt": self._attempt,
                 "executionCount": self._execution_count,
-                "stdout": "".join(stdout),
+                "stdout": stdout.value,
                 "result": None,
             }
 
@@ -278,26 +371,96 @@ class NotebookSession:
         else:
             argv = ["/bin/sh", "-lc", command]
 
-        env = os.environ.copy()
-        python_path = Path(executable)
-        env["PATH"] = os.pathsep.join([str(python_path.parent), env.get("PATH", "")]).rstrip(
-            os.pathsep
-        )
-        if (
-            python_path.parent.name == "bin"
-            and (python_path.parent.parent / "pyvenv.cfg").is_file()
-        ):
-            env["VIRTUAL_ENV"] = str(python_path.parent.parent)
+        yield from self._stream_host_process(argv, command=command)
+
+    def list_packages(self) -> list[dict[str, str]]:
+        if self.mode != "host" or self.python is None:
+            raise ValueError("Package management requires a host Python runtime")
+        with self._execution_lock:
+            self._assert_open()
+            self.touch()
+            completed = subprocess.run(
+                [
+                    self.python.executable,
+                    "-c",
+                    (
+                        "import importlib.metadata as m,json;"
+                        "print(json.dumps([{'name':d.metadata.get('Name') or d.name,"
+                        "'version':d.version} for d in m.distributions()]))"
+                    ),
+                ],
+                cwd=self.cwd,
+                env=self._host_process_env(),
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                raise RuntimeError(detail or "Could not list notebook packages")
+            value = json.loads(completed.stdout)
+            if not isinstance(value, list):
+                raise TypeError("Python package list must be an array")
+            packages = [
+                {"name": str(item["name"]), "version": str(item["version"])}
+                for item in value
+                if isinstance(item, Mapping) and "name" in item and "version" in item
+            ]
+            return sorted(packages, key=lambda item: item["name"].lower())
+
+    def stream_package_install(self, packages: Sequence[str]) -> Iterator[dict[str, Any]]:
+        if self.mode != "host" or self.python is None:
+            raise ValueError("Package management requires a host Python runtime")
+        with self._execution_lock:
+            self._assert_open()
+            self.touch()
+            return_code = 1
+            try:
+                requirements = _package_requirements(packages)
+                for event in self._stream_host_process(
+                    [self.python.executable, "-m", "pip", "install", *requirements],
+                    command="pip install " + " ".join(requirements),
+                    timeout=_PACKAGE_INSTALL_TIMEOUT,
+                ):
+                    if event["type"] == "output":
+                        yield event
+                    else:
+                        return_code = int(event["returnCode"])
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                yield {"type": "result", "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                return
+            yield {
+                "type": "result",
+                "ok": return_code == 0,
+                "returnCode": return_code,
+                "error": None if return_code == 0 else "Package installation failed",
+            }
+
+    def _stream_host_process(
+        self,
+        argv: Sequence[str],
+        *,
+        command: str,
+        timeout: float = _TERMINAL_TIMEOUT,
+    ) -> Iterator[dict[str, Any]]:
+        if self.python is None:
+            raise RuntimeError("Host process requires a selected Python interpreter")
 
         process = subprocess.Popen(
-            argv,
+            list(argv),
             cwd=self.cwd,
-            env=env,
+            env=self._host_process_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        output: Queue[tuple[str, str | None]] = Queue()
+        with self._state_lock:
+            if self._closed:
+                process.terminate()
+                raise BridgeCancelled("Notebook session was interrupted")
+            self._active_terminal_process = process
+        output: Queue[tuple[str, str | None]] = Queue(maxsize=128)
 
         def pump(stream_name: str, stream: Any) -> None:
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -321,14 +484,14 @@ class NotebookSession:
         for reader in readers:
             reader.start()
 
-        deadline = time.monotonic() + _TERMINAL_TIMEOUT
+        deadline = time.monotonic() + timeout
         open_streams = len(readers)
         try:
             while open_streams:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     process.kill()
-                    raise subprocess.TimeoutExpired(command, _TERMINAL_TIMEOUT)
+                    raise subprocess.TimeoutExpired(command, timeout)
                 try:
                     stream_name, text = output.get(timeout=min(remaining, 0.1))
                 except Empty:
@@ -340,6 +503,9 @@ class NotebookSession:
             return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
             yield {"type": "command_result", "returnCode": return_code}
         finally:
+            with self._state_lock:
+                if self._active_terminal_process is process:
+                    self._active_terminal_process = None
             if process.poll() is None:
                 process.terminate()
                 try:
@@ -347,6 +513,18 @@ class NotebookSession:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=1)
+
+    def _host_process_env(self) -> dict[str, str]:
+        if self.python is None:
+            raise RuntimeError("Host process requires a selected Python interpreter")
+        env = os.environ.copy()
+        python_path = Path(self.python.executable)
+        env["PATH"] = os.pathsep.join([str(python_path.parent), env.get("PATH", "")]).rstrip(
+            os.pathsep
+        )
+        if self.python.environment:
+            env["VIRTUAL_ENV"] = self.python.environment
+        return env
 
     def next_browser_request(self, *, timeout: float) -> dict[str, Any] | None:
         if self.mode != "browser" or not isinstance(self.bridge, BridgeRun):
@@ -364,15 +542,33 @@ class NotebookSession:
         self.bridge.submit_output(request_id, stream=stream, text=text)
 
     def close(self) -> None:
-        with self._lock:
+        with self._state_lock:
             if self._closed:
                 return
             self._closed = True
-            if isinstance(self.bridge, BridgeRun):
-                self.bridge.cancel()
-            else:
-                self.bridge.close()
+            terminal_process = self._active_terminal_process
+        if isinstance(self.bridge, BridgeRun):
+            self.bridge.cancel()
+        else:
+            self.bridge.close()
+        if terminal_process is not None and terminal_process.poll() is None:
+            terminal_process.terminate()
+        with self._execution_lock:
             self._session.close()
+
+    @property
+    def last_activity(self) -> float:
+        with self._state_lock:
+            return self._last_activity
+
+    def touch(self) -> None:
+        with self._state_lock:
+            self._last_activity = time.monotonic()
+
+    def _assert_open(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Notebook session is closed")
 
 
 class NotebookSessionManager:
@@ -381,9 +577,13 @@ class NotebookSessionManager:
         *,
         cwd: Path | None = None,
         explicit_pythons: Sequence[str | Path] = (),
+        host_environment: HostEnvironmentProvider | None = None,
+        interactive_options: Mapping[str, Any] | None = None,
     ) -> None:
         self.cwd = (cwd or Path.cwd()).resolve()
         self.pythons = discover_host_pythons(explicit_pythons)
+        self._host_environment = host_environment or HostEnvironmentManager()
+        self._interactive_options = dict(interactive_options or {})
         self._sessions: dict[str, NotebookSession] = {}
         self._lock = threading.Lock()
 
@@ -392,16 +592,35 @@ class NotebookSessionManager:
         *,
         mode: Literal["browser", "host"] = "browser",
         python_id: str | None = None,
+        session_snapshot: str | None = None,
     ) -> NotebookSession:
         python = None
         if mode == "host":
-            python = self._resolve_python(python_id)
+            selected = self._resolve_python(python_id)
+            prepared = self._host_environment.prepare(
+                executable=selected.executable,
+                version=selected.version,
+                cwd=self.cwd,
+            )
+            python = HostPython(
+                id=selected.id,
+                executable=prepared.executable,
+                version=selected.version,
+                label=f"{selected.label} - Kedi Notebook environment",
+                current=selected.current,
+                explicit=selected.explicit,
+                managed=True,
+                base_executable=selected.executable,
+                environment=prepared.directory,
+            )
         session_id = uuid4().hex
         session = NotebookSession(
             session_id=session_id,
             mode=mode,
             cwd=self.cwd,
             python=python,
+            interactive_options=self._interactive_options,
+            session_snapshot=session_snapshot,
         )
         with self._lock:
             self._sessions[session_id] = session
@@ -412,6 +631,7 @@ class NotebookSessionManager:
             session = self._sessions.get(session_id)
         if session is None:
             raise KeyError("Notebook session was not found")
+        session.touch()
         return session
 
     def close(self, session_id: str) -> None:
@@ -426,6 +646,27 @@ class NotebookSessionManager:
             self._sessions.clear()
         for session in sessions:
             session.close()
+
+    def reconfigure(self, *, interactive_options: Mapping[str, Any]) -> None:
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+            self._interactive_options = dict(interactive_options)
+        for session in sessions:
+            session.close()
+
+    def cleanup_stale(self, *, max_age: float) -> int:
+        cutoff = time.monotonic() - max_age
+        with self._lock:
+            stale_ids = [
+                session_id
+                for session_id, session in self._sessions.items()
+                if session.last_activity < cutoff
+            ]
+            sessions = [self._sessions.pop(session_id) for session_id in stale_ids]
+        for session in sessions:
+            session.close()
+        return len(sessions)
 
     def _resolve_python(self, python_id: str | None) -> HostPython:
         if not self.pythons:
@@ -492,6 +733,10 @@ def discover_host_pythons(explicit: Sequence[str | Path] = ()) -> list[HostPytho
                 raise ValueError(f"Cannot inspect Python executable: {executable}")
             continue
         major, minor, patch = metadata["version"]
+        if metadata.get("releaselevel") != "final":
+            if is_explicit:
+                raise ValueError("Kedi notebook host execution requires a final Python release")
+            continue
         if (major, minor) < (3, 10):
             if is_explicit:
                 raise ValueError("Kedi notebook host execution requires Python 3.10 or newer")
@@ -521,13 +766,34 @@ def discover_host_pythons(explicit: Sequence[str | Path] = ()) -> list[HostPytho
     ]
 
 
+def _load_session_snapshot(
+    snapshot: str,
+    *,
+    executor: PlaygroundExecutor | PyodideExecutor,
+) -> kedi.InteractiveSession:
+    with tempfile.TemporaryDirectory(prefix="kedi-notebook-restore-") as directory:
+        path = Path(directory) / "session.json"
+        try:
+            payload = base64.b64decode(snapshot, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Notebook session snapshot is not valid base64") from exc
+        path.write_bytes(payload)
+        return kedi.load_session(path, executor=executor)
+
+
 def _python_metadata(executable: Path) -> dict[str, Any] | None:
     try:
         completed = subprocess.run(
             [
                 str(executable),
                 "-c",
-                "import json,sys; print(json.dumps({'version': list(sys.version_info[:3])}))",
+                (
+                    "import json,ssl,sys,xml.parsers.expat; "
+                    "print(json.dumps({"
+                    "'version': list(sys.version_info[:3]),"
+                    "'releaselevel': sys.version_info.releaselevel"
+                    "}))"
+                ),
             ],
             text=True,
             capture_output=True,
@@ -546,10 +812,69 @@ def _json_result(value: object) -> dict[str, object] | None:
     if value is None:
         return None
     try:
-        json.dumps(value)
+        serialized = json.dumps(value)
     except (TypeError, ValueError):
-        return {"kind": "repr", "type": type(value).__name__, "value": repr(value)}
+        rendered = _truncate_output(repr(value))
+        return {"kind": "repr", "type": type(value).__name__, "value": rendered}
+    if len(serialized) > _OUTPUT_LIMIT:
+        return {
+            "kind": "repr",
+            "type": type(value).__name__,
+            "value": _truncate_output(serialized),
+            "truncated": True,
+        }
     return {"kind": "json", "type": type(value).__name__, "value": value}
+
+
+class _BoundedText:
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._parts: list[str] = []
+        self._size = 0
+        self._truncated = False
+
+    def append(self, text: str) -> str:
+        remaining = self._limit - self._size
+        accepted = ""
+        if remaining > 0:
+            accepted = text[:remaining]
+            self._parts.append(accepted)
+            self._size += len(accepted)
+        if len(text) > max(remaining, 0) and not self._truncated:
+            self._truncated = True
+            accepted += "\n[output truncated by Kedi Notebook]"
+        return accepted
+
+    @property
+    def value(self) -> str:
+        suffix = "\n[output truncated by Kedi Notebook]" if self._truncated else ""
+        return "".join(self._parts) + suffix
+
+    @property
+    def raw_value(self) -> str:
+        return "".join(self._parts)
+
+
+def _truncate_output(value: str) -> str:
+    output = _BoundedText(_OUTPUT_LIMIT)
+    output.append(value)
+    return output.value
+
+
+def _requires_runtime_reset(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (BridgeCancelled, TimeoutError, subprocess.TimeoutExpired)):
+            return True
+        original = getattr(current, "original", None)
+        current = (
+            original
+            if isinstance(original, BaseException)
+            else current.__cause__ or current.__context__
+        )
+    return False
 
 
 def _terminal_commands(source: str) -> list[str]:
@@ -567,6 +892,20 @@ def _terminal_commands(source: str) -> list[str]:
     if not commands:
         raise ValueError("Terminal cell has no commands")
     return commands
+
+
+def _package_requirements(packages: Sequence[str]) -> list[str]:
+    if not packages or len(packages) > 50:
+        raise ValueError("Provide between 1 and 50 package requirements")
+    requirements: list[str] = []
+    for package in packages:
+        requirement = package.strip()
+        if not requirement or len(requirement) > 300:
+            raise ValueError("Package requirements must contain 1 to 300 characters")
+        if requirement.startswith("-") or any(ord(character) < 32 for character in requirement):
+            raise ValueError(f"Invalid package requirement: {package!r}")
+        requirements.append(requirement)
+    return requirements
 
 
 __all__ = [

@@ -71,6 +71,192 @@ class PyrightServer:
             "range": source_range,
         }
 
+    def completion(
+        self,
+        source: str,
+        line: int,
+        character: int,
+    ) -> list[JsonObject] | None:
+        virtual, virtual_position = self._virtual_position(source, line, character)
+        if virtual_position is None:
+            return None
+        with self._document_lock:
+            self._ensure_started()
+            self._sync_document(str(virtual["text"]))
+            result = self._request(
+                "textDocument/completion",
+                {
+                    "textDocument": {"uri": self._uri},
+                    "position": virtual_position,
+                    "context": {"triggerKind": 1},
+                },
+            )
+        raw_items = result.get("items", []) if isinstance(result, Mapping) else result
+        if not isinstance(raw_items, Sequence):
+            return []
+        return [
+            mapped
+            for item in raw_items
+            if isinstance(item, Mapping)
+            and (mapped := _completion_item_to_source(virtual, item)) is not None
+        ]
+
+    def references(
+        self,
+        source: str,
+        line: int,
+        character: int,
+        *,
+        include_declaration: bool,
+    ) -> list[JsonObject] | None:
+        virtual, virtual_position = self._virtual_position(source, line, character)
+        if virtual_position is None:
+            return None
+        with self._document_lock:
+            self._ensure_started()
+            self._sync_document(str(virtual["text"]))
+            result = self._request(
+                "textDocument/references",
+                {
+                    "textDocument": {"uri": self._uri},
+                    "position": virtual_position,
+                    "context": {"includeDeclaration": include_declaration},
+                },
+            )
+        if not isinstance(result, Sequence):
+            return []
+        references: list[JsonObject] = []
+        for location in result:
+            if not isinstance(location, Mapping) or location.get("uri") != self._uri:
+                continue
+            range_ = location.get("range")
+            if (
+                isinstance(range_, Mapping)
+                and (source_range := _virtual_range_to_source(virtual, range_)) is not None
+            ):
+                references.append({"range": source_range})
+        return references
+
+    def prepare_rename(
+        self,
+        source: str,
+        line: int,
+        character: int,
+    ) -> JsonObject | None:
+        virtual, virtual_position = self._virtual_position(source, line, character)
+        if virtual_position is None:
+            return None
+        with self._document_lock:
+            self._ensure_started()
+            self._sync_document(str(virtual["text"]))
+            result = self._request(
+                "textDocument/prepareRename",
+                {
+                    "textDocument": {"uri": self._uri},
+                    "position": virtual_position,
+                },
+            )
+        if not isinstance(result, Mapping):
+            return None
+        virtual_range = result.get("range", result)
+        if not isinstance(virtual_range, Mapping):
+            return None
+        source_range = _virtual_range_to_source(virtual, virtual_range)
+        if source_range is None:
+            return None
+        return {
+            "range": source_range,
+            "placeholder": result.get("placeholder"),
+        }
+
+    def rename(
+        self,
+        source: str,
+        line: int,
+        character: int,
+        new_name: str,
+    ) -> list[JsonObject] | None:
+        virtual, virtual_position = self._virtual_position(source, line, character)
+        if virtual_position is None:
+            return None
+        with self._document_lock:
+            self._ensure_started()
+            self._sync_document(str(virtual["text"]))
+            result = self._request(
+                "textDocument/rename",
+                {
+                    "textDocument": {"uri": self._uri},
+                    "position": virtual_position,
+                    "newName": new_name,
+                },
+            )
+        if not isinstance(result, Mapping):
+            return []
+        changes = result.get("changes")
+        if isinstance(changes, Mapping):
+            edits = changes.get(self._uri, [])
+        else:
+            document_changes = result.get("documentChanges")
+            edits = []
+            if isinstance(document_changes, Sequence):
+                for change in document_changes:
+                    if not isinstance(change, Mapping):
+                        continue
+                    document = change.get("textDocument")
+                    if isinstance(document, Mapping) and document.get("uri") == self._uri:
+                        candidate_edits = change.get("edits", [])
+                        if isinstance(candidate_edits, Sequence):
+                            edits.extend(candidate_edits)
+        if not isinstance(edits, Sequence):
+            return []
+        return [
+            mapped
+            for edit in edits
+            if isinstance(edit, Mapping)
+            and (mapped := _text_edit_to_source(virtual, edit)) is not None
+        ]
+
+    def diagnostics(self, source: str) -> list[JsonObject]:
+        virtual = compute_python_virtual_document(source, source_path=None)
+        if not virtual.get("ranges") and not virtual.get("mappings"):
+            return []
+
+        with self._document_lock:
+            self._ensure_started()
+            self._sync_document(str(virtual["text"]))
+            report = self._request(
+                "textDocument/diagnostic",
+                {"textDocument": {"uri": self._uri}},
+            )
+            diagnostics = report.get("items", []) if isinstance(report, Mapping) else []
+
+        mapped: list[JsonObject] = []
+        for diagnostic in diagnostics:
+            range_ = diagnostic.get("range")
+            if not isinstance(range_, Mapping):
+                continue
+            source_range = _virtual_range_to_source(virtual, range_)
+            if source_range is None:
+                continue
+            mapped.append({**diagnostic, "range": source_range, "source": "pyright"})
+        return mapped
+
+    def _virtual_position(
+        self,
+        source: str,
+        line: int,
+        character: int,
+    ) -> tuple[JsonObject, Position | None]:
+        virtual = compute_python_virtual_document(
+            source,
+            source_path=None,
+            focus_line=line,
+        )
+        return virtual, _source_position_to_virtual(
+            virtual,
+            {"line": line, "character": character},
+        )
+
     def close(self) -> None:
         with self._lifecycle_lock:
             process = self._process
@@ -317,6 +503,46 @@ def _virtual_range_to_source(
     if source_start is None or source_end is None:
         return None
     return {"start": source_start, "end": source_end}
+
+
+def _text_edit_to_source(
+    virtual: Mapping[str, Any],
+    edit: Mapping[str, Any],
+) -> JsonObject | None:
+    range_ = edit.get("range")
+    new_text = edit.get("newText")
+    if not isinstance(range_, Mapping) or not isinstance(new_text, str):
+        return None
+    source_range = _virtual_range_to_source(virtual, range_)
+    return None if source_range is None else {"range": source_range, "newText": new_text}
+
+
+def _completion_item_to_source(
+    virtual: Mapping[str, Any],
+    item: Mapping[str, Any],
+) -> JsonObject | None:
+    label = item.get("label")
+    if not isinstance(label, str):
+        return None
+    mapped: JsonObject = {
+        key: value
+        for key, value in item.items()
+        if key not in {"textEdit", "additionalTextEdits", "data"}
+    }
+    text_edit = item.get("textEdit")
+    if isinstance(text_edit, Mapping):
+        mapped_edit = _text_edit_to_source(virtual, text_edit)
+        if mapped_edit is not None:
+            mapped["textEdit"] = mapped_edit
+    additional = item.get("additionalTextEdits")
+    if isinstance(additional, Sequence):
+        mapped["additionalTextEdits"] = [
+            mapped_edit
+            for edit in additional
+            if isinstance(edit, Mapping)
+            and (mapped_edit := _text_edit_to_source(virtual, edit)) is not None
+        ]
+    return mapped
 
 
 def _contains(range_: Mapping[str, Any], position: Position) -> bool:

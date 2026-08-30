@@ -5,5 +5,11 @@ from .runtime import (
     NotebookSessionManager,
     discover_host_pythons,
 )
+from .secrets import NotebookSecretStore
 
-__all__ = ["HostPython", "NotebookSessionManager", "discover_host_pythons"]
+__all__ = [
+    "HostPython",
+    "NotebookSecretStore",
+    "NotebookSessionManager",
+    "discover_host_pythons",
+]

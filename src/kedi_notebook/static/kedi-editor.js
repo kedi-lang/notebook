@@ -15,17 +15,22 @@ const executionDecorations = new WeakMap();
 const tipDecorations = new WeakMap();
 const highlighters = new WeakMap();
 const lspContexts = new WeakMap();
+const diagnosticTimers = new WeakMap();
 const treeSitterResources = preloadKediTreeSitterResources();
 
 export async function createKediEditor(element, value, onChange, options = {}) {
-  const [monaco] = await Promise.all([loadMonaco(), treeSitterResources]);
+  let monaco;
+  try {
+    [monaco] = await Promise.all([loadMonaco(), treeSitterResources]);
+  } catch {
+    return createFallbackEditor(element, value, onChange, options);
+  }
   await registerKediLanguage(monaco);
   defineKediThemes(monaco);
-  const theme = options.theme === "light" ? "kedi-light" : "kedi-dark";
   const editor = monaco.editor.create(element, {
     value,
     language: "kedi",
-    theme,
+    theme: "kedi-dark",
     automaticLayout: true,
     fontFamily: '"IBM Plex Mono", monospace',
     fontSize: 13.5,
@@ -52,16 +57,53 @@ export async function createKediEditor(element, value, onChange, options = {}) {
   editor.onDidChangeModelContent(() => {
     clearKediExecutionDiagnostic(editor);
     onChange(editor.getValue());
+    scheduleDiagnostics(monaco, editor.getModel());
   });
+  scheduleDiagnostics(monaco, editor.getModel());
   return editor;
 }
 
-export function setKediEditorTheme(theme) {
-  if (!globalThis.monaco) {
-    return;
-  }
-  defineKediThemes(globalThis.monaco);
-  globalThis.monaco.editor.setTheme(theme === "light" ? "kedi-light" : "kedi-dark");
+function createFallbackEditor(element, value, onChange, options) {
+  const textarea = document.createElement("textarea");
+  textarea.className = "kedi-fallback-editor";
+  textarea.value = value;
+  textarea.readOnly = Boolean(options.editor?.readOnly);
+  textarea.spellcheck = false;
+  element.replaceChildren(textarea);
+  const listeners = new Set();
+  const resize = () => {
+    textarea.style.height = "0";
+    textarea.style.height = `${Math.max(52, Math.min(520, textarea.scrollHeight))}px`;
+    for (const listener of listeners) {
+      listener();
+    }
+  };
+  textarea.addEventListener("input", () => {
+    onChange(textarea.value);
+    resize();
+  });
+  resize();
+  return {
+    dispose() {
+      listeners.clear();
+      textarea.remove();
+    },
+    focus: () => textarea.focus(),
+    getContentHeight: () => textarea.scrollHeight,
+    getModel: () => null,
+    getValue: () => textarea.value,
+    layout: resize,
+    updateOptions(nextOptions) {
+      if ("readOnly" in nextOptions) {
+        textarea.readOnly = Boolean(nextOptions.readOnly);
+      }
+    },
+    onDidContentSizeChange(listener) {
+      listeners.add(listener);
+      return { dispose: () => listeners.delete(listener) };
+    },
+    revealLineInCenterIfOutsideViewport() {},
+  };
 }
 
 function defineKediThemes(monaco) {
@@ -106,41 +148,6 @@ function defineKediThemes(monaco) {
       "editorIndentGuide.activeBackground1": "#454D63",
       "editorBracketMatch.background": "#31384A",
       "editorBracketMatch.border": "#89DCEB",
-    },
-  });
-  monaco.editor.defineTheme("kedi-light", {
-    base: "vs",
-    inherit: true,
-    semanticHighlighting: true,
-    rules: [
-      { token: "comment", foreground: "697386", fontStyle: "italic" },
-      { token: "string", foreground: "267A3A" },
-      { token: "number", foreground: "A34A28" },
-      { token: "keyword", foreground: "7B3FB2" },
-      { token: "operator", foreground: "136B78" },
-      { token: "type", foreground: "8A5A00" },
-      { token: "class", foreground: "8A5A00" },
-      { token: "function", foreground: "195BAA" },
-      { token: "method", foreground: "195BAA" },
-      { token: "parameter", foreground: "A72B4A" },
-      { token: "variable", foreground: "9A4E12" },
-      { token: "property", foreground: "167064" },
-      { token: "namespace", foreground: "176F9B" },
-      { token: "decorator", foreground: "7B3FB2" },
-    ],
-    colors: {
-      "editor.background": "#FFFFFF",
-      "editor.foreground": "#20242B",
-      "editorLineNumber.foreground": "#A0A7B1",
-      "editorLineNumber.activeForeground": "#586170",
-      "editorCursor.foreground": "#176F9B",
-      "editor.lineHighlightBackground": "#F5F7F9",
-      "editor.selectionBackground": "#CDE0F5",
-      "editor.inactiveSelectionBackground": "#E1EAF3",
-      "editorIndentGuide.background1": "#E8EBEF",
-      "editorIndentGuide.activeBackground1": "#B7BEC8",
-      "editorBracketMatch.background": "#E7F2F3",
-      "editorBracketMatch.border": "#176F9B",
     },
   });
 }
@@ -299,6 +306,9 @@ async function registerKediLanguage(monaco) {
       };
     },
     async provideDocumentSemanticTokens(model, lastResultId, cancellationToken) {
+      if (model.isDisposed()) {
+        return null;
+      }
       const version = model.getVersionId();
       let highlighterPromise = highlighters.get(model);
       if (!highlighterPromise) {
@@ -308,6 +318,7 @@ async function registerKediLanguage(monaco) {
       const highlighter = await highlighterPromise;
       if (
         cancellationToken.isCancellationRequested ||
+        model.isDisposed() ||
         version !== model.getVersionId()
       ) {
         return null;
@@ -318,6 +329,9 @@ async function registerKediLanguage(monaco) {
   });
   monaco.languages.registerHoverProvider("kedi", {
     async provideHover(model, position, cancellationToken) {
+      if (model.isDisposed()) {
+        return null;
+      }
       const version = model.getVersionId();
       const context = lspContexts.get(model)?.() ?? {
         source: model.getValue(),
@@ -334,6 +348,7 @@ async function registerKediLanguage(monaco) {
       });
       if (
         cancellationToken.isCancellationRequested ||
+        model.isDisposed() ||
         version !== model.getVersionId() ||
         !result.hover
       ) {
@@ -345,7 +360,265 @@ async function registerKediLanguage(monaco) {
       };
     },
   });
+  monaco.languages.registerCompletionItemProvider("kedi", {
+    triggerCharacters: [">", "<", "[", ":", "."],
+    async provideCompletionItems(model, position, completionContext, cancellationToken) {
+      if (model.isDisposed()) {
+        return { suggestions: [] };
+      }
+      const version = model.getVersionId();
+      const context = lspContext(model);
+      const result = await fetchJson("/api/lsp/completion", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(positionPayload(context, position)),
+      });
+      if (
+        cancellationToken.isCancellationRequested ||
+        model.isDisposed() ||
+        version !== model.getVersionId()
+      ) {
+        return { suggestions: [] };
+      }
+      return {
+        suggestions: result.items.flatMap((item) => {
+          const range = item.textEdit?.range
+            ? lspRangeToMonaco(monaco, item.textEdit.range, context.lineOffset)
+            : undefined;
+          if (range && !rangeInsideModel(model, range)) {
+            return [];
+          }
+          const additionalTextEdits = (item.additionalTextEdits || []).flatMap((edit) => {
+            const editRange = lspRangeToMonaco(monaco, edit.range, context.lineOffset);
+            return editRange && rangeInsideModel(model, editRange)
+              ? [{ range: editRange, text: edit.newText }]
+              : [];
+          });
+          return [{
+            label: item.label,
+            kind: completionKind(monaco, item.kind),
+            detail: item.detail,
+            documentation: completionDocumentation(item.documentation),
+            insertText: item.textEdit?.newText || item.insertText || item.label,
+            insertTextRules:
+              item.insertTextFormat === 2
+                ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
+                : undefined,
+            range,
+            sortText: item.sortText,
+            filterText: item.filterText,
+            additionalTextEdits,
+          }];
+        }),
+      };
+    },
+  });
+  monaco.languages.registerSignatureHelpProvider("kedi", {
+    signatureHelpTriggerCharacters: ["(", ","],
+    async provideSignatureHelp(model, position, cancellationToken) {
+      if (model.isDisposed()) {
+        return null;
+      }
+      const version = model.getVersionId();
+      const context = lspContext(model);
+      const result = await fetchJson("/api/lsp/signature", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(positionPayload(context, position)),
+      });
+      if (
+        cancellationToken.isCancellationRequested ||
+        model.isDisposed() ||
+        version !== model.getVersionId() ||
+        !result.signature
+      ) {
+        return null;
+      }
+      return { value: result.signature, dispose() {} };
+    },
+  });
+  monaco.languages.registerDefinitionProvider("kedi", {
+    async provideDefinition(model, position, cancellationToken) {
+      if (model.isDisposed()) {
+        return null;
+      }
+      const version = model.getVersionId();
+      const context = lspContext(model);
+      const result = await fetchJson("/api/lsp/definition", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(positionPayload(context, position)),
+      });
+      if (
+        cancellationToken.isCancellationRequested ||
+        model.isDisposed() ||
+        version !== model.getVersionId() ||
+        !result.definition
+      ) {
+        return null;
+      }
+      const range = lspRangeToMonaco(
+        monaco,
+        result.definition.range,
+        context.lineOffset,
+      );
+      if (!range || range.startLineNumber < 1 || range.endLineNumber > model.getLineCount()) {
+        return null;
+      }
+      return { uri: model.uri, range };
+    },
+  });
+  monaco.languages.registerReferenceProvider("kedi", {
+    async provideReferences(model, position, referenceContext, cancellationToken) {
+      if (model.isDisposed()) {
+        return [];
+      }
+      const version = model.getVersionId();
+      const context = lspContext(model);
+      const result = await fetchJson("/api/lsp/references", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...positionPayload(context, position),
+          includeDeclaration: referenceContext.includeDeclaration,
+        }),
+      });
+      if (
+        cancellationToken.isCancellationRequested ||
+        model.isDisposed() ||
+        version !== model.getVersionId()
+      ) {
+        return [];
+      }
+      return result.references.flatMap((item) => {
+        const range = lspRangeToMonaco(monaco, item.range, context.lineOffset);
+        return range && rangeInsideModel(model, range) ? [{ uri: model.uri, range }] : [];
+      });
+    },
+  });
+  monaco.languages.registerRenameProvider("kedi", {
+    async resolveRenameLocation(model, position, cancellationToken) {
+      const context = lspContext(model);
+      const result = await fetchJson("/api/lsp/prepare-rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(positionPayload(context, position)),
+      });
+      if (cancellationToken.isCancellationRequested || !result.rename) {
+        return { rejectReason: "This symbol cannot be renamed" };
+      }
+      const range = lspRangeToMonaco(
+        monaco,
+        result.rename.range,
+        context.lineOffset,
+      );
+      if (!range || !rangeInsideModel(model, range)) {
+        return { rejectReason: "Rename target belongs to an earlier notebook cell" };
+      }
+      return { range, text: model.getValueInRange(range) };
+    },
+    async provideRenameEdits(model, position, newName, cancellationToken) {
+      const context = lspContext(model);
+      const result = await fetchJson("/api/lsp/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...positionPayload(context, position),
+          newName,
+        }),
+      });
+      if (cancellationToken.isCancellationRequested) {
+        return { edits: [] };
+      }
+      const edits = [];
+      for (const item of result.edits) {
+        const range = lspRangeToMonaco(monaco, item.range, context.lineOffset);
+        if (!range || !rangeInsideModel(model, range)) {
+          return {
+            edits: [],
+            rejectReason: "Rename spans an earlier notebook cell; rename it from that cell",
+          };
+        }
+        edits.push({
+          resource: model.uri,
+          textEdit: { range, text: item.newText },
+          versionId: model.getVersionId(),
+        });
+      }
+      return { edits };
+    },
+  });
   languageRegistered = true;
+}
+
+function lspContext(model) {
+  return lspContexts.get(model)?.() ?? { source: model.getValue(), lineOffset: 0 };
+}
+
+function positionPayload(context, position) {
+  return {
+    source: context.source,
+    line: position.lineNumber - 1 + context.lineOffset,
+    character: position.column - 1,
+  };
+}
+
+function scheduleDiagnostics(monaco, model) {
+  if (!model) {
+    return;
+  }
+  clearTimeout(diagnosticTimers.get(model));
+  diagnosticTimers.set(
+    model,
+    setTimeout(async () => {
+      if (model.isDisposed()) {
+        return;
+      }
+      const version = model.getVersionId();
+      const context = lspContext(model);
+      try {
+        const result = await fetchJson("/api/lsp/diagnostics", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ source: context.source }),
+        });
+        if (model.isDisposed() || version !== model.getVersionId()) {
+          return;
+        }
+        const severity = {
+          1: monaco.MarkerSeverity.Error,
+          2: monaco.MarkerSeverity.Warning,
+          3: monaco.MarkerSeverity.Info,
+          4: monaco.MarkerSeverity.Hint,
+        };
+        const markers = result.diagnostics.flatMap((diagnostic) => {
+          const range = lspRangeToMonaco(monaco, diagnostic.range, context.lineOffset);
+          if (
+            !range ||
+            range.startLineNumber < 1 ||
+            range.endLineNumber > model.getLineCount()
+          ) {
+            return [];
+          }
+          return [{
+            startLineNumber: range.startLineNumber,
+            startColumn: range.startColumn,
+            endLineNumber: range.endLineNumber,
+            endColumn: range.endColumn,
+            severity: severity[diagnostic.severity] || monaco.MarkerSeverity.Error,
+            message: diagnostic.message,
+            code: diagnostic.code,
+            source: diagnostic.source || "kedi",
+          }];
+        });
+        monaco.editor.setModelMarkers(model, "kedi-lsp", markers);
+      } catch {
+        if (!model.isDisposed() && version === model.getVersionId()) {
+          monaco.editor.setModelMarkers(model, "kedi-lsp", []);
+        }
+      }
+    }, 250),
+  );
 }
 
 function lspRangeToMonaco(monaco, range, lineOffset = 0) {
@@ -360,8 +633,60 @@ function lspRangeToMonaco(monaco, range, lineOffset = 0) {
   );
 }
 
+function rangeInsideModel(model, range) {
+  return (
+    range.startLineNumber >= 1 &&
+    range.endLineNumber <= model.getLineCount() &&
+    range.startColumn >= 1 &&
+    range.endColumn <= model.getLineMaxColumn(range.endLineNumber)
+  );
+}
+
+function completionKind(monaco, kind) {
+  const mapping = {
+    1: "Text",
+    2: "Method",
+    3: "Function",
+    4: "Constructor",
+    5: "Field",
+    6: "Variable",
+    7: "Class",
+    8: "Interface",
+    9: "Module",
+    10: "Property",
+    11: "Unit",
+    12: "Value",
+    13: "Enum",
+    14: "Keyword",
+    15: "Snippet",
+    16: "Color",
+    17: "File",
+    18: "Reference",
+    19: "Folder",
+    20: "EnumMember",
+    21: "Constant",
+    22: "Struct",
+    23: "Event",
+    24: "Operator",
+    25: "TypeParameter",
+  };
+  return monaco.languages.CompletionItemKind[mapping[kind] || "Text"];
+}
+
+function completionDocumentation(value) {
+  if (!value) {
+    return undefined;
+  }
+  return typeof value === "string" ? value : { value: value.value || "" };
+}
+
 async function fetchJson(url, options) {
-  const response = await fetch(url, options);
+  const headers = new Headers(options?.headers || {});
+  const token = globalThis.__KEDI_NOTEBOOK_API_TOKEN;
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const response = await fetch(url, { ...options, headers });
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.error || `HTTP ${response.status} from ${url}`);

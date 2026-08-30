@@ -100,7 +100,7 @@ export class PyodideRuntime {
         }
         const text = event.data.text ?? "";
         const stream = event.data.stream === "stderr" ? "stderr" : "stdout";
-        pending[stream] += text;
+        pending[stream] = appendBoundedOutput(pending[stream], text);
         const callback = event.data.stream === "stderr" ? this.onStderr : this.onStdout;
         callback(text);
         const requestCallback =
@@ -157,6 +157,23 @@ export class PyodideRuntime {
       cancelStdin(message.buffer);
     }
   }
+}
+
+const MAX_OUTPUT_CHARS = 200_000;
+const OUTPUT_TRUNCATION_NOTICE = "\n[output truncated by Kedi Notebook]";
+
+function appendBoundedOutput(current, addition) {
+  if (!addition || current.endsWith(OUTPUT_TRUNCATION_NOTICE)) {
+    return current;
+  }
+  const remaining = MAX_OUTPUT_CHARS - current.length;
+  if (remaining <= 0) {
+    return current + OUTPUT_TRUNCATION_NOTICE;
+  }
+  if (addition.length <= remaining) {
+    return current + addition;
+  }
+  return current + addition.slice(0, remaining) + OUTPUT_TRUNCATION_NOTICE;
 }
 
 const STDIN_HEADER_BYTES = 16;
