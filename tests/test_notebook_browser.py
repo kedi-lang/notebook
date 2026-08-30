@@ -177,7 +177,10 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
             timeout=30_000,
         )
         page.evaluate('globalThis.monaco.editor.getModels()[0].setValue("= `sum(values)`")')
-        assert page.evaluate("globalThis.monaco.editor.getModels()[0].getValue()") == "= `sum(values)`"
+        assert (
+            page.evaluate("globalThis.monaco.editor.getModels()[0].getValue()")
+            == "= `sum(values)`"
+        )
         restored_run = first.locator('button[aria-label="Run cell"]')
         playwright.expect(restored_run).to_be_enabled()
         restored_run.click()
