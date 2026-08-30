@@ -4,6 +4,8 @@ Kedi Notebook is the local, incremental notebook interface for the Kedi
 Programming Language. It provides editable Kedi, terminal, and Markdown cells,
 with either browser-owned Pyodide or a selected host Python interpreter.
 
+![Kedi Notebook running incremental Kedi cells](.github/assets/kedi-notebook.png)
+
 ## Install and Run
 
 The notebook is currently distributed from a Kedi source checkout. Install its
