@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -10,11 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
-    "basedpyright>=1.39.6",
-    "fastapi>=0.138.1",
-    "kedi>=0.4.0",
-    "python-dotenv>=1.0",
-    "uvicorn>=0.30",
+    "basedpyright>=1.39.6,<1.40",
+    "fastapi>=0.138.1,<0.139",
+    "kedi>=0.4,<0.5",
+    "python-dotenv>=1.2.2,<2",
+    "uvicorn>=0.47,<0.48",
 ]
 
 [project.urls]
@@ -26,11 +26,11 @@ kedi-notebook = "kedi_notebook.server:main"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.27",
-    "playwright>=1.49",
-    "pytest>=8.2",
-    "pytest-cov>=5",
-    "ruff>=0.15",
+    "httpx==0.28.1",
+    "playwright==1.62.0",
+    "pytest==9.0.3",
+    "pytest-cov==7.1.0",
+    "ruff==0.15.16",
 ]
 
 [tool.hatch.build]
@@ -41,6 +41,9 @@ include = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kedi_notebook"]
+
+[tool.uv.sources]
+kedi = { path = "..", editable = true }
 
 [tool.ruff]
 line-length = 100
