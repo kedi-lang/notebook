@@ -281,9 +281,7 @@ def create_app(
             dotenv_path = _resolve_dotenv_path(payload.path, cwd=resolved_cwd)
             parsed = dotenv_values(dotenv_path)
             values = {
-                name: value
-                for name, value in parsed.items()
-                if value is not None and value != ""
+                name: value for name, value in parsed.items() if value is not None and value != ""
             }
             imported = secrets.set_many(values)
             manager.reconfigure(

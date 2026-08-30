@@ -150,8 +150,7 @@ def test_notebook_secret_api_imports_relative_dotenv_without_returning_values(
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("KEDI_ADAPTER_MODEL", raising=False)
     (tmp_path / "notebook.env").write_text(
-        "OPENROUTER_API_KEY=not-a-real-key\n"
-        "KEDI_ADAPTER_MODEL=openrouter:test/imported-model\n",
+        "OPENROUTER_API_KEY=not-a-real-key\nKEDI_ADAPTER_MODEL=openrouter:test/imported-model\n",
         encoding="utf-8",
     )
     app = create_app(

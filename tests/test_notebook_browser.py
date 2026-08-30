@@ -112,8 +112,9 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
         )
         dependent.locator('button[aria-label="Run cell"]').click()
         playwright.expect(dependent.locator(".error-content")).to_be_visible(timeout=30_000)
-        assert page.evaluate(
-            """() => {
+        assert (
+            page.evaluate(
+                """() => {
               const model = globalThis.monaco.editor.getModels().find(
                 (candidate) => candidate.getValue() === "= `len(values)`",
               );
@@ -122,14 +123,17 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
                 resource: model.uri,
               }).length;
             }"""
-        ) == 1
+            )
+            == 1
+        )
 
         first.locator('button[aria-label="Run cell"]').click()
         playwright.expect(first.locator(".result-value")).to_have_text("38", timeout=30_000)
         dependent.locator('button[aria-label="Run cell"]').click()
         playwright.expect(dependent.locator(".result-value")).to_have_text("3", timeout=30_000)
-        assert page.evaluate(
-            """() => {
+        assert (
+            page.evaluate(
+                """() => {
               const model = globalThis.monaco.editor.getModels().find(
                 (candidate) => candidate.getValue() === "= `len(values)`",
               );
@@ -138,7 +142,9 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
                 resource: model.uri,
               }).length;
             }"""
-        ) == 0
+            )
+            == 0
+        )
         page.once("dialog", lambda dialog: dialog.accept())
         dependent.locator('button[aria-label="Delete cell"]').click()
         playwright.expect(page.locator(".cell")).to_have_count(1)
@@ -178,8 +184,7 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
         )
         page.evaluate('globalThis.monaco.editor.getModels()[0].setValue("= `sum(values)`")')
         assert (
-            page.evaluate("globalThis.monaco.editor.getModels()[0].getValue()")
-            == "= `sum(values)`"
+            page.evaluate("globalThis.monaco.editor.getModels()[0].getValue()") == "= `sum(values)`"
         )
         restored_run = first.locator('button[aria-label="Run cell"]')
         playwright.expect(restored_run).to_be_enabled()
