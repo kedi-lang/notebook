@@ -48,6 +48,16 @@ variables already present in its process. Set `KEDI_ADAPTER_MODEL` there or use
 inside a host Python cell affects only that cell worker, not the server process
 that owns adapters; browser Python cannot read the host project's `.env`.
 
+When a native Pydantic AI model requires a missing provider SDK, the notebook
+installs only the provider group named by Pydantic AI, immediately before model
+construction. OpenRouter, for example, requests the `openai` group. Unused
+provider SDKs are not installed. Installation targets the notebook server's
+Python environment, keeps its existing package versions, and requires package
+index access on first use. It does not replay earlier statements in the cell.
+Provider credentials are still required. A dependency conflict or failed
+installation is shown as a cell error; specialized adapters retain their own
+installation requirements.
+
 The **Secret Manager** action in the top bar stores environment values outside
 the notebook at `~/.kedi/notebook/secrets.json`. Stored values take precedence
 over the server process and project `.env`, and the browser can list only their
@@ -65,6 +75,9 @@ Python executable, installs Kedi into it, and starts one persistent worker from
 that environment. Kedi cells
 execute incrementally against that session; completed cells remain editable
 and rerunnable, and output is displayed under its source.
+The bundled `filesystem` module works in both modes: browser mode accesses the
+worker's temporary virtual filesystem, while host mode accesses the notebook
+working directory on disk.
 
 Every visible cell keeps its editor when focus moves elsewhere; inactive Kedi
 cells retain syntax highlighting and can be edited or run directly. The cell

@@ -26,6 +26,10 @@ const state = {
   runtime: "browser",
   runningCellId: null,
   packageInstalling: false,
+  secretUpdating: false,
+  notebookTransition: false,
+  savingNotebook: false,
+  editRevision: 0,
   pendingSessionSnapshot: null,
   dirty: false,
   interrupting: false,
@@ -84,6 +88,9 @@ let browserWarmup = null;
 let toastTimer = null;
 let activeRequestController = null;
 let liveOutputFrame = null;
+let renderQueue = Promise.resolve();
+let bridgeFailure = null;
+let sessionStartup = null;
 
 restoreDraft();
 if (!state.cells.length) {
@@ -164,13 +171,19 @@ function bindEvents() {
 }
 
 function addCellFromControl(append) {
+  if (state.notebookTransition) {
+    showToast("Wait for the active operation to finish");
+    return;
+  }
   const kind = ["kedi", "terminal", "markdown"].includes(ui.cellKind.value)
     ? ui.cellKind.value
     : "kedi";
   const activeIndex = state.cells.findIndex((cell) => cell.id === state.activeCellId);
   const index = append || activeIndex < 0 ? state.cells.length : activeIndex + 1;
-  addCell(kind, kind === "terminal" ? "!" : "", index);
-  void render().then(focusActiveEditor);
+  const cell = addCell(kind, kind === "terminal" ? "!" : "", index);
+  if (cell) {
+    void renderAddedCell(cell);
+  }
 }
 
 function addCell(kind, source, index = state.cells.length) {
@@ -195,17 +208,61 @@ function addCell(kind, source, index = state.cells.length) {
   return cell;
 }
 
-async function render() {
+function queueRender(task) {
+  renderQueue = renderQueue.then(task).catch((error) => {
+    showToast(error?.message || "Could not render notebook cells");
+  });
+  return renderQueue;
+}
+
+function render() {
+  return queueRender(renderAllCells);
+}
+
+async function renderAllCells() {
   disposeEditors();
   ui.title.value = state.title;
   ui.cells.replaceChildren();
-  for (const [cellPosition, cell] of state.cells.entries()) {
+  for (const [cellPosition, cell] of [...state.cells].entries()) {
     ui.cells.append(await renderCell(cell, cellPosition + 1));
   }
   ui.runtime.value = state.runtime;
-  ui.runtime.disabled = Boolean(state.sessionId);
+  ui.runtime.disabled = Boolean(state.sessionId || sessionStartup || state.notebookTransition);
   syncRuntimeControls();
   globalThis.lucide?.createIcons();
+}
+
+function renderAddedCell(cell) {
+  return queueRender(async () => {
+    const position = state.cells.indexOf(cell);
+    if (position < 0) {
+      return;
+    }
+    if (ui.cells.querySelector(`[data-cell-id="${cell.id}"]`)) {
+      if (state.activeCellId === cell.id) {
+        focusActiveEditor();
+      }
+      return;
+    }
+    const article = await renderCell(cell, position + 1);
+    const next = state.cells.slice(position + 1)
+      .map((item) => ui.cells.querySelector(`[data-cell-id="${item.id}"]`))
+      .find(Boolean);
+    ui.cells.insertBefore(article, next || null);
+    for (const [index, item] of state.cells.entries()) {
+      const current = ui.cells.querySelector(`[data-cell-id="${item.id}"]`);
+      if (!current) {
+        continue;
+      }
+      current.querySelector(".cell-index").textContent = `[${index + 1}]`;
+      current.querySelector(".cell-actions").replaceWith(cellActions(item));
+    }
+    syncCellRunButtons();
+    globalThis.lucide?.createIcons();
+    if (state.activeCellId === cell.id) {
+      focusActiveEditor();
+    }
+  });
 }
 
 async function renderCell(cell, cellNumber) {
@@ -266,6 +323,7 @@ async function renderCell(cell, cellNumber) {
       },
       {
         editor: {
+          fontFamily: '"Geist Mono", ui-monospace, monospace',
           readOnly: state.runningCellId === cell.id,
           lineNumbers: "on",
           folding: false,
@@ -428,6 +486,13 @@ async function runCell(cellId) {
   if (!cell || state.runningCellId) {
     return;
   }
+  if (
+    state.secretUpdating || state.packageInstalling || state.notebookTransition ||
+    state.savingNotebook
+  ) {
+    showToast("Wait for the active operation to finish");
+    return;
+  }
   selectCell(cellId);
   if (!cell.source.trim()) {
     showToast("Cell is empty");
@@ -440,6 +505,7 @@ async function runCell(cellId) {
   const kind = effectiveCellKind(cell);
   if (kind === "markdown") {
     cell.status = "success";
+    markChanged();
     await render();
     focusActiveEditor();
     return;
@@ -451,6 +517,7 @@ async function runCell(cellId) {
     markChanged();
   }
   state.runningCellId = cellId;
+  bridgeFailure = null;
   state.interrupting = false;
   ui.interruptSession.hidden = false;
   ui.interruptSession.disabled = false;
@@ -487,26 +554,30 @@ async function runCell(cellId) {
     cell.status = "success";
     cell.stdout = payload.stdout || "";
     cell.result = payload.result;
-    state.activeCellId = cell.id;
     setRuntimeStatus("Ready");
   } catch (error) {
     cell.status = "error";
     cell.error = state.interrupting
       ? "Execution interrupted; runtime state was reset"
-      : error?.message || String(error);
+      : bridgeFailure?.message || error?.message || String(error);
     cell.stdout = error?.payload?.stdout || cell.stdout;
     cell.diagnostic = error?.payload?.diagnostic || null;
-    if (state.interrupting || error?.payload?.runtimeReset) {
+    const failedSession = state.sessionId;
+    if (failedSession && (state.interrupting || error?.payload?.runtimeReset || !error?.payload)) {
       releaseRuntimeSession();
+      if (!state.interrupting && failedSession && !error?.payload?.runtimeReset) {
+        void apiFetch(`/api/notebook/sessions/${failedSession}`, { method: "DELETE" }).catch(() => {});
+      }
     }
-    state.activeCellId = cell.id;
     setRuntimeStatus("Failed", "error");
   } finally {
+    bridgeFailure = null;
     activeRequestController = null;
     state.runningCellId = null;
     state.interrupting = false;
     ui.interruptSession.hidden = true;
     syncRuntimeControls();
+    markChanged();
     if (kindChanged) {
       await render();
     } else {
@@ -581,33 +652,51 @@ async function interruptExecution() {
     }
   } finally {
     activeRequestController?.abort();
-    releaseRuntimeSession();
+    if (state.sessionId === sessionId) {
+      releaseRuntimeSession();
+    }
   }
 }
 
-async function ensureSession() {
-  if (state.sessionId) {
-    return;
+function ensureSession() {
+  if (sessionStartup) {
+    return sessionStartup;
   }
+  if (state.sessionId) {
+    return Promise.resolve();
+  }
+  sessionStartup = startSession().finally(() => {
+    sessionStartup = null;
+  });
+  return sessionStartup;
+}
+
+async function startSession() {
   const selected = ui.runtime.selectedOptions[0];
   const mode = selected?.dataset.mode === "host" ? "host" : "browser";
   const pythonId = mode === "host" ? selected.value : null;
   setRuntimeStatus(mode === "browser" ? "Loading Pyodide" : "Starting Python", "busy");
+  ui.runtime.disabled = true;
   const restoring = state.pendingSessionSnapshot !== null;
-  const payload = await fetchJson(
-    restoring ? "/api/notebook/sessions/restore" : "/api/notebook/sessions",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        mode,
-        pythonId,
-        ...(restoring ? { snapshot: state.pendingSessionSnapshot } : {}),
-      }),
-    },
-  );
+  let payload;
+  try {
+    payload = await fetchJson(
+      restoring ? "/api/notebook/sessions/restore" : "/api/notebook/sessions",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode,
+          pythonId,
+          ...(restoring ? { snapshot: state.pendingSessionSnapshot } : {}),
+        }),
+      },
+    );
+  } catch (error) {
+    ui.runtime.disabled = false;
+    throw error;
+  }
   state.sessionId = payload.sessionId;
-  state.pendingSessionSnapshot = null;
   state.runtime = pythonId || "browser";
   ui.runtime.disabled = true;
   if (payload.python?.environment) {
@@ -616,12 +705,22 @@ async function ensureSession() {
   }
   syncRuntimeControls();
   if (mode === "browser") {
-    const runtime = await prewarmBrowserRuntime();
-    browserBridge = new BrowserSessionBridge(state.sessionId, runtime);
-    await browserBridge.start();
+    try {
+      const runtime = await prewarmBrowserRuntime();
+      browserBridge = new BrowserSessionBridge(state.sessionId, runtime);
+      await browserBridge.start();
+    } catch (error) {
+      const failedSession = state.sessionId;
+      const snapshot = state.pendingSessionSnapshot;
+      releaseRuntimeSession();
+      state.pendingSessionSnapshot = snapshot;
+      void apiFetch(`/api/notebook/sessions/${failedSession}`, { method: "DELETE" }).catch(() => {});
+      throw error;
+    }
   } else {
     setRuntimeStatus("Ready");
   }
+  state.pendingSessionSnapshot = null;
 }
 
 class BrowserSessionBridge {
@@ -678,7 +777,14 @@ class BrowserSessionBridge {
         );
       } catch (error) {
         if (this.active) {
-          setRuntimeStatus(error?.message || "Browser runtime failed", "error");
+          bridgeFailure = error instanceof Error ? error : new Error(String(error));
+          activeRequestController?.abort();
+          const failedSession = this.sessionId;
+          releaseRuntimeSession();
+          void apiFetch(`/api/notebook/sessions/${failedSession}`, { method: "DELETE" }).catch(() => {});
+          if (!state.runningCellId) {
+            setRuntimeStatus(bridgeFailure.message, "error");
+          }
         }
         return;
       }
@@ -743,49 +849,81 @@ function releaseRuntimeSession() {
   }
   state.sessionId = null;
   state.pendingSessionSnapshot = null;
-  ui.runtime.disabled = false;
+  ui.runtime.disabled = Boolean(state.notebookTransition);
   ui.packageDialog.close();
   ui.packageEnvironment.textContent = "";
   syncRuntimeControls();
 }
 
-async function resetRuntimeSession() {
-  if (state.runningCellId || state.packageInstalling) {
+async function transitionNotebook(replaceContents = null) {
+  if (
+    state.runningCellId || state.packageInstalling || state.secretUpdating ||
+    state.notebookTransition || state.savingNotebook || sessionStartup
+  ) {
     showToast("Wait for the active operation to finish");
-    return;
+    return false;
   }
-  if (state.sessionId) {
-    await apiFetch(`/api/notebook/sessions/${state.sessionId}`, { method: "DELETE" });
-  }
-  releaseRuntimeSession();
-  for (const cell of state.cells) {
-    if (cell.kind !== "markdown") {
-      cell.status = "draft";
-      cell.stdout = "";
-      cell.result = null;
-      cell.error = null;
-      cell.diagnostic = null;
+  state.notebookTransition = true;
+  ui.runtime.disabled = true;
+  try {
+    if (state.sessionId) {
+      await fetchJson(`/api/notebook/sessions/${state.sessionId}`, { method: "DELETE" });
     }
+    releaseRuntimeSession();
+    for (const cell of state.cells) {
+      if (cell.kind !== "markdown") {
+        cell.status = "draft";
+        cell.stdout = "";
+        cell.result = null;
+        cell.error = null;
+        cell.diagnostic = null;
+      }
+    }
+    state.activeCellId = state.cells.find((cell) => cell.kind !== "markdown")?.id || null;
+    replaceContents?.();
+    if (!replaceContents) {
+      markChanged();
+    }
+    setRuntimeStatus("New session");
+    await render();
+    return true;
+  } catch (error) {
+    showToast(error?.message || "Could not reset notebook session");
+    return false;
+  } finally {
+    state.notebookTransition = false;
+    ui.runtime.disabled = Boolean(state.sessionId || sessionStartup);
   }
-  state.activeCellId = state.cells.find((cell) => cell.kind !== "markdown")?.id || null;
-  setRuntimeStatus("New session");
-  await render();
+}
+
+async function resetRuntimeSession() {
+  await transitionNotebook();
 }
 
 async function newNotebook() {
+  if (
+    state.runningCellId || state.packageInstalling || state.secretUpdating ||
+    state.notebookTransition || state.savingNotebook || sessionStartup
+  ) {
+    showToast("Wait for the active operation to finish");
+    return;
+  }
   if (!confirmDiscard("Start a new notebook and discard unsaved changes?")) {
     return;
   }
-  await resetRuntimeSession();
-  state.title = "Untitled notebook";
-  state.cells = [];
-  addCell("kedi", "");
-  markChanged();
-  await render();
+  await transitionNotebook(() => {
+    state.title = "Untitled notebook";
+    state.cells = [];
+    addCell("kedi", "");
+    markChanged();
+  });
 }
 
 function openSaveDialog() {
-  if (state.runningCellId || state.packageInstalling) {
+  if (
+    state.runningCellId || state.packageInstalling || state.secretUpdating ||
+    state.notebookTransition || state.savingNotebook || sessionStartup
+  ) {
     showToast("Wait for the active operation to finish");
     return;
   }
@@ -797,8 +935,30 @@ async function saveNotebook(mode) {
   if (!["progress", "notebook"].includes(mode)) {
     throw new Error("Unsupported notebook save mode");
   }
+  if (
+    state.runningCellId || state.packageInstalling || state.secretUpdating ||
+    state.notebookTransition || state.savingNotebook || sessionStartup
+  ) {
+    showToast("Wait for the active operation to finish");
+    return;
+  }
+  const savedTitle = state.title;
+  const savedCells = state.cells.map((cell) => {
+    const saved = { kind: cell.kind, source: cell.source, hidden: cell.hidden };
+    if (mode === "progress") {
+      saved.progress = {
+        status: cell.status === "running" ? "draft" : cell.status,
+        stdout: cell.stdout,
+        result: cell.result,
+        error: cell.error,
+      };
+    }
+    return saved;
+  });
+  const savedRevision = state.editRevision;
   let sessionSnapshot = null;
   if (mode === "progress") {
+    state.savingNotebook = true;
     try {
       if (state.sessionId) {
         const payload = await fetchJson(
@@ -812,25 +972,16 @@ async function saveNotebook(mode) {
     } catch (error) {
       showToast(error?.message || "Current Kedi session cannot be saved");
       return;
+    } finally {
+      state.savingNotebook = false;
     }
   }
   const notebookDocument = {
     format: "kedi-notebook",
     version: 2,
     saveMode: mode,
-    title: state.title,
-    cells: state.cells.map((cell) => {
-      const saved = { kind: cell.kind, source: cell.source, hidden: cell.hidden };
-      if (mode === "progress") {
-        saved.progress = {
-          status: cell.status === "running" ? "draft" : cell.status,
-          stdout: cell.stdout,
-          result: cell.result,
-          error: cell.error,
-        };
-      }
-      return saved;
-    }),
+    title: savedTitle,
+    cells: savedCells,
   };
   if (sessionSnapshot) {
     notebookDocument.sessionSnapshot = sessionSnapshot;
@@ -845,12 +996,14 @@ async function saveNotebook(mode) {
   ui.saveDialog.close();
   const link = documentElement("a", {
     href: URL.createObjectURL(blob),
-    download: `${fileStem(state.title)}.kedinb`,
+    download: `${fileStem(savedTitle)}.kedinb`,
   });
   link.click();
   setTimeout(() => URL.revokeObjectURL(link.href), 0);
-  state.dirty = false;
-  ui.saveState.textContent = "Saved";
+  if (state.editRevision === savedRevision) {
+    state.dirty = false;
+    ui.saveState.textContent = "Saved";
+  }
   showToast(mode === "progress" ? "Progress saved" : "Notebook saved");
 }
 
@@ -860,41 +1013,57 @@ async function openNotebookFile() {
   if (!file) {
     return;
   }
+  if (
+    state.runningCellId || state.packageInstalling || state.secretUpdating ||
+    state.notebookTransition || state.savingNotebook || sessionStartup
+  ) {
+    showToast("Wait for the active operation to finish");
+    return;
+  }
   try {
     if (file.size > MAX_NOTEBOOK_BYTES) {
       throw new Error("Notebook file is larger than 5 MB");
     }
     const value = JSON.parse(await file.text());
     validateNotebookDocument(value);
+    if (
+      state.runningCellId || state.packageInstalling || state.secretUpdating ||
+      state.notebookTransition || state.savingNotebook || sessionStartup
+    ) {
+      showToast("Wait for the active operation to finish");
+      return;
+    }
     if (!confirmDiscard("Open this notebook and discard unsaved changes?")) {
       return;
     }
-    await resetRuntimeSession();
-    state.pendingSessionSnapshot = value.sessionSnapshot || null;
-    state.title = typeof value.title === "string" ? value.title : file.name;
-    state.cells = value.cells.map((cell) => {
-      const progress = value.saveMode === "progress" ? cell.progress : null;
-      return {
-        id: crypto.randomUUID(),
-        kind: normalizeCellKind(cell.kind),
-        source: typeof cell.source === "string" ? cell.source : "",
-        status: progress?.status || "draft",
-        stdout: progress?.stdout || "",
-        result: progress?.result ?? null,
-        error: progress?.error || null,
-        diagnostic: null,
-        hidden: cell.hidden === true,
-      };
+    const opened = await transitionNotebook(() => {
+      state.pendingSessionSnapshot = value.sessionSnapshot || null;
+      state.title = typeof value.title === "string" ? value.title : file.name;
+      state.cells = value.cells.map((cell) => {
+        const progress = value.saveMode === "progress" ? cell.progress : null;
+        return {
+          id: crypto.randomUUID(),
+          kind: normalizeCellKind(cell.kind),
+          source: typeof cell.source === "string" ? cell.source : "",
+          status: progress?.status || "draft",
+          stdout: progress?.stdout || "",
+          result: progress?.result ?? null,
+          error: progress?.error || null,
+          diagnostic: null,
+          hidden: cell.hidden === true,
+        };
+      });
+      if (!state.cells.length) {
+        addCell("kedi", "");
+      }
+      state.activeCellId = state.cells[0].id;
+      state.dirty = false;
+      ui.saveState.textContent = "Opened";
+      persistDraft();
     });
-    if (!state.cells.length) {
-      addCell("kedi", "");
+    if (opened) {
+      showToast(state.pendingSessionSnapshot ? "Notebook progress loaded" : "Notebook opened");
     }
-    state.activeCellId = state.cells[0].id;
-    state.dirty = false;
-    ui.saveState.textContent = "Opened";
-    persistDraft();
-    await render();
-    showToast(state.pendingSessionSnapshot ? "Notebook progress loaded" : "Notebook opened");
   } catch (error) {
     showToast(error?.message || "Cannot open notebook");
   }
@@ -1005,7 +1174,10 @@ function syncRuntimeControls() {
 }
 
 async function openPackageManager() {
-  if (ui.runtime.selectedOptions[0]?.dataset.mode !== "host") {
+  if (
+    ui.runtime.selectedOptions[0]?.dataset.mode !== "host" ||
+    state.runningCellId || state.notebookTransition
+  ) {
     return;
   }
   try {
@@ -1076,7 +1248,7 @@ function renderSecretList(names) {
 async function saveSecret() {
   const name = ui.secretName.value.trim();
   const value = ui.secretValue.value;
-  if (!name || !value) {
+  if (!name || !value || !beginSecretUpdate()) {
     return;
   }
   ui.saveSecret.disabled = true;
@@ -1092,13 +1264,14 @@ async function saveSecret() {
   } catch (error) {
     showToast(error?.message || "Could not save environment value");
   } finally {
+    state.secretUpdating = false;
     ui.saveSecret.disabled = false;
   }
 }
 
 async function importDotenv() {
   const path = ui.dotenvPath.value.trim();
-  if (!path) {
+  if (!path || !beginSecretUpdate()) {
     return;
   }
   ui.importDotenv.disabled = true;
@@ -1117,12 +1290,20 @@ async function importDotenv() {
   } catch (error) {
     showToast(error?.message || "Could not import .env file");
   } finally {
+    state.secretUpdating = false;
     ui.importDotenv.disabled = false;
   }
 }
 
 async function deleteSecret(name) {
+  if (state.runningCellId || state.packageInstalling || state.secretUpdating) {
+    showToast("Wait for the active operation to finish");
+    return;
+  }
   if (!globalThis.confirm(`Delete ${name} from Secret Manager?`)) {
+    return;
+  }
+  if (!beginSecretUpdate()) {
     return;
   }
   try {
@@ -1134,7 +1315,21 @@ async function deleteSecret(name) {
     await applySecretRuntimeReset(payload, `${name} deleted`);
   } catch (error) {
     showToast(error?.message || "Could not delete environment value");
+  } finally {
+    state.secretUpdating = false;
   }
+}
+
+function beginSecretUpdate() {
+  if (
+    state.runningCellId || state.packageInstalling || state.secretUpdating ||
+    state.notebookTransition || state.savingNotebook || sessionStartup
+  ) {
+    showToast("Wait for the active operation to finish");
+    return false;
+  }
+  state.secretUpdating = true;
+  return true;
 }
 
 async function applySecretRuntimeReset(payload, message) {
@@ -1149,6 +1344,7 @@ async function applySecretRuntimeReset(payload, message) {
         cell.diagnostic = null;
       }
     }
+    markChanged();
     setRuntimeStatus("New session");
     await render();
   }
@@ -1196,7 +1392,11 @@ function renderPackageList(packages) {
 }
 
 async function installPackages() {
-  if (state.packageInstalling || !state.sessionId) {
+  if (
+    state.packageInstalling || state.runningCellId || state.notebookTransition ||
+    state.savingNotebook ||
+    !state.sessionId
+  ) {
     return;
   }
   const packages = ui.packageRequirements.value
@@ -1529,10 +1729,12 @@ function iconButton(icon, label) {
 
 function setRuntimeStatus(message, kind = "") {
   ui.runtimeStatus.className = `runtime-status${kind ? ` ${kind}` : ""}`;
+  ui.runtimeStatus.title = message;
   ui.runtimeStatus.lastElementChild.textContent = message;
 }
 
 function markChanged() {
+  state.editRevision += 1;
   state.dirty = true;
   ui.saveState.textContent = "Unsaved";
   persistDraft();

@@ -415,6 +415,52 @@ def test_host_environment_falls_back_to_venv_and_ensurepip(
     ]
 
 
+def test_host_notebook_installs_only_missing_provider_without_replaying_cell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic_ai.models.test import TestModel
+
+    from kedi_notebook import model_dependencies
+
+    installed: list[str] = []
+    model = TestModel(call_tools=[], custom_output_text="HELLO")
+
+    def infer(name: str) -> TestModel:
+        assert name == "openrouter:example/model"
+        if not installed:
+            raise ImportError("Install pydantic-ai-slim[openai]")
+        return model
+
+    monkeypatch.setattr(model_dependencies, "infer_model", infer)
+    monkeypatch.setattr(model_dependencies, "_install_provider_extra", installed.append)
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        result = session.execute(
+            cell_id="provider",
+            source="""```
+counter = globals().get("counter", 0) + 1
+print("before-model", counter)
+```
+> model: openrouter:example/model
+[output] << Reply with HELLO.
+> show: <output>
+> show: <counter>
+""",
+        )
+    finally:
+        manager.close_all()
+
+    assert result["ok"] is True
+    assert result["stdout"] == "before-model 1\nHELLO\n1\n"
+    assert installed == ["openai"]
+
+
 def test_host_notebook_session_keeps_kedi_and_selected_python_state(tmp_path: Path) -> None:
     manager = NotebookSessionManager(
         cwd=tmp_path,
@@ -437,6 +483,30 @@ def test_host_notebook_session_keeps_kedi_and_selected_python_state(tmp_path: Pa
     assert second["ok"] is True
     assert second["executionCount"] == 2
     assert second["stdout"] == "42\n"
+
+
+def test_host_notebook_imports_filesystem_and_reads_written_file(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        result = session.execute(
+            cell_id="filesystem",
+            source=(
+                "> import: filesystem\n"
+                '> show: <write_text_file(`"note.txt"`, `"notebook value"`)>\n'
+                '> show: <read_text_file(`"note.txt"`)>'
+            ),
+        )
+    finally:
+        manager.close_all()
+
+    assert result["ok"] is True
+    assert str(result["stdout"]).endswith("notebook value\n")
+    assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "notebook value"
 
 
 def test_host_notebook_terminal_uses_selected_python_and_working_directory(

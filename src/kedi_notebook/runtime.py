@@ -23,11 +23,13 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import kedi
+from kedi.agent_adapter.model_resolution import pydantic_model_resolution
 from kedi.executors import PlaygroundExecutor, PyodideExecutor
 
 from .bridge import BridgeCancelled, BridgeRun
 from .execution import execution_error_payload
 from .host_environment import HostEnvironmentManager, HostEnvironmentProvider
+from .model_dependencies import resolve_notebook_model
 
 _RESPONSE_PREFIX = "__KEDI_NOTEBOOK_RESPONSE__"
 _WORKER = Path(__file__).with_name("sandbox_worker.py")
@@ -218,7 +220,8 @@ class NotebookSession:
             self._attempt += 1
             source_name = _notebook_source_name(self.id, self._attempt)
             try:
-                result = self._session.execute(source, source_name=source_name)
+                with pydantic_model_resolution(resolve_notebook_model):
+                    result = self._session.execute(source, source_name=source_name)
             except BaseException as exc:
                 payload = execution_error_payload(exc, source_paths={source_name})
                 payload.update(

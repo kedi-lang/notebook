@@ -312,5 +312,104 @@ def test_browser_runtime_uses_vendored_pyodide(notebook_url: str) -> None:
         run_button.click()
         playwright.expect(cell.locator(".output-content")).to_have_text("10", timeout=60_000)
 
+        page.evaluate(
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            (
+                "> import: filesystem\n"
+                '> show: <write_text_file(`"note.txt"`, `"browser value"`)>\n'
+                '> show: <read_text_file(`"note.txt"`)>'
+            ),
+        )
+        run_button.click()
+        playwright.expect(cell.locator(".output-content").last).to_contain_text(
+            "browser value", timeout=60_000
+        )
+
+        page.route(
+            "**/api/notebook/sessions/*/bridge/response",
+            lambda route: route.abort(),
+            times=1,
+        )
+        page.evaluate(
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            "> show: `7`",
+        )
+        run_button.click()
+        playwright.expect(cell.locator(".error-content")).to_be_visible(timeout=15_000)
+        playwright.expect(run_button).to_be_enabled(timeout=15_000)
+        run_button.click()
+        playwright.expect(cell.locator(".output-content")).to_have_text("7", timeout=60_000)
+
         assert external_pyodide_requests == []
+        browser.close()
+
+
+def test_adding_cells_during_execution_keeps_running_cell_and_editor(notebook_url: str) -> None:
+    chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    executable = os.environ.get("KEDI_NOTEBOOK_BROWSER")
+    if executable is None and chrome.is_file():
+        executable = str(chrome)
+
+    with playwright.sync_playwright() as engine:
+        browser = engine.chromium.launch(
+            headless=True,
+            **({"executable_path": executable} if executable else {}),
+        )
+        page = browser.new_page(viewport={"width": 1200, "height": 800})
+        page.goto(notebook_url, wait_until="networkidle", timeout=120_000)
+        host = page.locator('#runtime-select option[data-mode="host"]').first
+        page.select_option("#runtime-select", host.get_attribute("value"))
+        first = page.locator(".cell").first
+        page.wait_for_function(
+            "() => !!globalThis.monaco?.editor?.getModels().length",
+            timeout=60_000,
+        )
+        page.evaluate(
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            "> show: `(__import__('time').sleep(2), 42)[1]`",
+        )
+        model_uri = page.evaluate("globalThis.monaco.editor.getModels().at(-1).uri.toString()")
+        first.locator('button[aria-label="Run cell"]').click()
+        playwright.expect(first.locator(".cell-run-button.running")).to_be_visible()
+
+        first_id = first.get_attribute("data-cell-id")
+        page.locator("#new-notebook").click()
+        playwright.expect(page.locator("#toast")).to_contain_text("Wait for the active operation")
+        assert first.get_attribute("data-cell-id") == first_id
+
+        page.locator("#add-cell").click()
+        page.locator("#add-cell").click()
+        playwright.expect(page.locator(".cell")).to_have_count(3)
+        assert page.evaluate(
+            "uri => globalThis.monaco.editor.getModels()"
+            ".some(model => model.uri.toString() === uri)",
+            model_uri,
+        )
+        assert first.locator(".cell-index").inner_text() == "[1]"
+        assert page.locator(".cell").last.locator(".cell-index").inner_text() == "[3]"
+        page.evaluate(
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            "> show: `99`",
+        )
+        playwright.expect(first.locator(".output-content")).to_have_text("42", timeout=30_000)
+        playwright.expect(first.locator('button[aria-label="Run cell"]')).to_be_enabled()
+        last = page.locator(".cell").last
+        playwright.expect(last.locator(".editor-host")).to_be_visible()
+        last.locator('button[aria-label="Run cell"]').click()
+        playwright.expect(last.locator(".output-content")).to_have_text("99", timeout=30_000)
+        page.route(
+            "**/api/notebook/sessions/*/cells/execute",
+            lambda route: route.abort(),
+            times=1,
+        )
+        page.evaluate(
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            "> show: `11`",
+        )
+        last.locator('button[aria-label="Run cell"]').click()
+        playwright.expect(last.locator(".error-content")).to_be_visible(timeout=15_000)
+        playwright.expect(last.locator('button[aria-label="Run cell"]')).to_be_enabled()
+        last.locator('button[aria-label="Run cell"]').click()
+        playwright.expect(last.locator(".output-content")).to_have_text("11", timeout=30_000)
+        assert page.locator(".cell.active").count() == 1
         browser.close()

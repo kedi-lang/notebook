@@ -4,75 +4,81 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="referrer" content="no-referrer" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#111315" />
     <title>Kedi Notebook</title>
-    <link rel="icon" href="data:," />
+    <link rel="icon" type="image/svg+xml" href="/notebook/assets/kedi-logo-white.svg" />
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+    <link rel="preload" href="/notebook/assets/geist-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/notebook/assets/geist-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="/notebook/notebook.css" />
     <script src="/vendor/lucide.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs/loader.js"></script>
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand" aria-label="Kedi Notebook">
-        <span class="brand-mark" aria-hidden="true">/\_/\</span>
-        <span class="brand-name">Kedi</span>
-        <span class="brand-section">Notebook</span>
+    <header class="notebook-header">
+      <div class="topbar">
+        <div class="brand" aria-label="Kedi Notebook">
+          <img class="brand-mark" src="/notebook/assets/kedi-logo-white.svg" alt="" width="44" height="29" />
+          <span class="brand-name">kedi</span>
+          <span class="brand-section">Notebook</span>
+        </div>
+        <div class="document-title">
+          <input id="notebook-title" value="Untitled notebook" maxlength="200" aria-label="Notebook title" />
+          <span id="save-state" class="save-state">Local</span>
+        </div>
+        <nav class="topbar-actions" aria-label="Notebook actions">
+          <button id="manage-secrets" class="command-button topbar-command" type="button">
+            <i data-lucide="key-round"></i>
+            <span>Secret Manager</span>
+          </button>
+          <button id="new-notebook" class="icon-button" type="button" title="New notebook" aria-label="New notebook">
+            <i data-lucide="file-plus-2"></i>
+          </button>
+          <button id="open-notebook" class="icon-button" type="button" title="Open notebook" aria-label="Open notebook">
+            <i data-lucide="folder-open"></i>
+          </button>
+          <button id="save-notebook" class="icon-button" type="button" title="Save notebook" aria-label="Save notebook">
+            <i data-lucide="download"></i>
+          </button>
+        </nav>
       </div>
-      <div class="document-title">
-        <input id="notebook-title" value="Untitled notebook" maxlength="200" aria-label="Notebook title" />
-        <span id="save-state" class="save-state">Local</span>
-      </div>
-      <nav class="topbar-actions" aria-label="Notebook actions">
-        <button id="manage-secrets" class="command-button topbar-command" type="button">
-          <i data-lucide="key-round"></i>
-          <span>Secret Manager</span>
-        </button>
-        <button id="new-notebook" class="icon-button" type="button" title="New notebook" aria-label="New notebook">
-          <i data-lucide="file-plus-2"></i>
-        </button>
-        <button id="open-notebook" class="icon-button" type="button" title="Open notebook" aria-label="Open notebook">
-          <i data-lucide="folder-open"></i>
-        </button>
-        <button id="save-notebook" class="icon-button" type="button" title="Save notebook" aria-label="Save notebook">
-          <i data-lucide="download"></i>
-        </button>
-      </nav>
-    </header>
 
-    <div class="command-strip">
-      <div class="command-inner">
-        <div class="add-cell-control">
-          <button id="add-cell" class="command-button" type="button">
-            <i data-lucide="plus"></i>
-            <span>Add cell</span>
-          </button>
-          <select id="cell-kind" aria-label="New cell type">
-            <option value="kedi">Kedi</option>
-            <option value="terminal">Terminal</option>
-            <option value="markdown">Markdown</option>
-          </select>
-        </div>
-        <div class="runtime-control">
-          <span id="runtime-status" class="runtime-status" aria-live="polite">
-            <span class="status-dot"></span>
-            <span>Ready</span>
-          </span>
-          <label for="runtime-select">Runtime</label>
-          <select id="runtime-select" aria-label="Execution runtime">
-            <option value="browser">Browser - Pyodide 3.14</option>
-          </select>
-          <button id="manage-packages" class="icon-button compact" type="button" title="Manage host packages" aria-label="Manage host packages" hidden>
-            <i data-lucide="package-plus"></i>
-          </button>
-          <button id="reset-session" class="icon-button compact" type="button" title="Start a new runtime session" aria-label="Start a new runtime session">
-            <i data-lucide="rotate-ccw"></i>
-          </button>
-          <button id="interrupt-session" class="icon-button compact danger-action" type="button" title="Interrupt execution" aria-label="Interrupt execution" hidden>
-            <i data-lucide="square"></i>
-          </button>
+      <div class="command-strip">
+        <div class="command-inner">
+          <div class="add-cell-control">
+            <button id="add-cell" class="command-button" type="button">
+              <i data-lucide="plus"></i>
+              <span>Add cell</span>
+            </button>
+            <select id="cell-kind" aria-label="New cell type">
+              <option value="kedi">Kedi</option>
+              <option value="terminal">Terminal</option>
+              <option value="markdown">Markdown</option>
+            </select>
+          </div>
+          <div class="runtime-control">
+            <span id="runtime-status" class="runtime-status" aria-live="polite">
+              <span class="status-dot"></span>
+              <span>Ready</span>
+            </span>
+            <label for="runtime-select">Runtime</label>
+            <select id="runtime-select" aria-label="Execution runtime">
+              <option value="browser">Browser - Pyodide 3.14</option>
+            </select>
+            <button id="manage-packages" class="icon-button compact" type="button" title="Manage host packages" aria-label="Manage host packages" hidden>
+              <i data-lucide="package-plus"></i>
+            </button>
+            <button id="reset-session" class="icon-button compact" type="button" title="Start a new runtime session" aria-label="Start a new runtime session">
+              <i data-lucide="rotate-ccw"></i>
+            </button>
+            <button id="interrupt-session" class="icon-button compact danger-action" type="button" title="Interrupt execution" aria-label="Interrupt execution" hidden>
+              <i data-lucide="square"></i>
+            </button>
+          </div>
         </div>
       </div>
-    </div>
+    </header>
 
     <main class="notebook-shell">
       <section id="cells" class="cells" aria-label="Notebook cells"></section>
