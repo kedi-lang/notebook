@@ -45,6 +45,9 @@
 "effort" @keyword
 "approval" @keyword
 "codemode" @keyword
+"requires" @keyword
+"show" @keyword
+"tool" @keyword
 "system" @keyword
 "mcp" @keyword
 "settings" @keyword
@@ -129,6 +132,15 @@
   value: (history_plain_value) @string)
 (history_directive "history" @keyword)
 
+(hooks_directive
+  ">" @operator)
+(hooks_directive "hooks" @keyword)
+(hooks_plain_value) @constant.builtin
+(hooks_field
+  name: (identifier) @property)
+(hooks_field
+  value: (inline_python_expr) @string.special)
+
 (skills_directive
   ">" @operator)
 (skills_directive "skills" @keyword)
@@ -145,12 +157,33 @@
   name: (identifier) @property)
 (codemode_field value: (settings_plain_value) @string)
 (codemode_field value: (inline_python_expr) @string.special)
+(codemode_preload_tools_field
+  name: (identifier) @property)
+(codemode_preload_tools_field value: (settings_plain_value) @string)
+(codemode_preload_tools_field value: (inline_python_expr) @string.special)
+(codemode_preload_tool_name value: (codemode_tool_name) @string)
+(tool_field name: (identifier) @property)
+(tool_field value: (tool_plain_value) @string)
+(tool_retry_on "retry_on" @property)
+(tool_exception_name name: (identifier) @type)
+(requires_directive name: (identifier) @constant)
+(requirement_name name: (identifier) @constant)
 (history_field name: (identifier) @property)
 (history_field value: (settings_plain_value) @string)
 (history_field value: (inline_python_expr) @string.special)
 (agent_directive
   value: (adapter_plain_value) @label)
-(agent_field name: (identifier) @label)
+(agent_directive
+  !value
+  body: (agent_body
+    (agent_field name: (identifier) @label)))
+(agent_directive
+  value: (adapter_plain_value)
+  body: (agent_body
+    (agent_field name: (identifier) @property)))
+(agent_section name: (identifier) @property)
+(agent_section_body
+  (agent_field name: (identifier) @property))
 (agent_field
   value: (agent_command_plain_value) @string)
 (agent_field
@@ -199,6 +232,10 @@
   value: (artifacts_plain_value) @string)
 (artifacts_field
   value: (inline_python_expr) @string.special)
+(artifacts_field
+  name: (identifier) @_query_artifacts
+  value: (artifacts_plain_value) @constant.builtin
+  (#eq? @_query_artifacts "query_artifacts"))
 
 ; ----------------------------------------------------------------
 ; Python source embedded in Kedi (these regions get a Python

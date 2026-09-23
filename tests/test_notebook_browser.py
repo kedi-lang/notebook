@@ -108,7 +108,7 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
         dependent = page.locator(".cell").nth(1)
         page.evaluate(
             "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
-            "= `len(values)`",
+            "> show: `len(values)`",
         )
         dependent.locator('button[aria-label="Run cell"]').click()
         playwright.expect(dependent.locator(".error-content")).to_be_visible(timeout=30_000)
@@ -116,7 +116,7 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
             page.evaluate(
                 """() => {
               const model = globalThis.monaco.editor.getModels().find(
-                (candidate) => candidate.getValue() === "= `len(values)`",
+                (candidate) => candidate.getValue() === "> show: `len(values)`",
               );
               return globalThis.monaco.editor.getModelMarkers({
                 owner: "kedi-runtime",
@@ -128,14 +128,14 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
         )
 
         first.locator('button[aria-label="Run cell"]').click()
-        playwright.expect(first.locator(".result-value")).to_have_text("38", timeout=30_000)
+        playwright.expect(first.locator(".output-content")).to_have_text("38", timeout=30_000)
         dependent.locator('button[aria-label="Run cell"]').click()
-        playwright.expect(dependent.locator(".result-value")).to_have_text("3", timeout=30_000)
+        playwright.expect(dependent.locator(".output-content")).to_have_text("3", timeout=30_000)
         assert (
             page.evaluate(
                 """() => {
               const model = globalThis.monaco.editor.getModels().find(
-                (candidate) => candidate.getValue() === "= `len(values)`",
+                (candidate) => candidate.getValue() === "> show: `len(values)`",
               );
               return globalThis.monaco.editor.getModelMarkers({
                 owner: "kedi-runtime",
@@ -159,7 +159,8 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
         progress_document = json.loads(progress_path.read_text(encoding="utf-8"))
         assert progress_document["version"] == 2
         assert progress_document["saveMode"] == "progress"
-        assert progress_document["cells"][0]["progress"]["result"] is not None
+        assert progress_document["cells"][0]["progress"]["result"] is None
+        assert progress_document["cells"][0]["progress"]["stdout"] == "38\n"
         session_document = json.loads(
             base64.b64decode(progress_document["sessionSnapshot"], validate=True)
         )
@@ -178,25 +179,28 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
 
         page.locator("#notebook-file").set_input_files(str(progress_path))
         playwright.expect(page.locator("#save-state")).to_have_text("Opened")
-        playwright.expect(page.locator(".cell").first.locator(".result-value")).to_have_text(
+        playwright.expect(page.locator(".cell").first.locator(".output-content")).to_have_text(
             "38",
             timeout=30_000,
         )
-        page.evaluate('globalThis.monaco.editor.getModels()[0].setValue("= `sum(values)`")')
+        page.evaluate(
+            'globalThis.monaco.editor.getModels().at(-1).setValue("> show: `sum(values)`")'
+        )
         assert (
-            page.evaluate("globalThis.monaco.editor.getModels()[0].getValue()") == "= `sum(values)`"
+            page.evaluate("globalThis.monaco.editor.getModels().at(-1).getValue()")
+            == "> show: `sum(values)`"
         )
         restored_run = first.locator('button[aria-label="Run cell"]')
         playwright.expect(restored_run).to_be_enabled()
         restored_run.click()
-        playwright.expect(first.locator(".result-value")).to_have_text("10", timeout=30_000)
+        playwright.expect(first.locator(".output-content")).to_have_text("10", timeout=30_000)
         page.evaluate(
-            "source => globalThis.monaco.editor.getModels()[0].setValue(source)",
-            "[values: list[int]] = `[2, 3, 5]`\n= `sum(value * value for value in values)`",
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            "[values: list[int]] = `[2, 3, 5]`\n> show: `sum(value * value for value in values)`",
         )
 
         first.locator('button[aria-label="Run cell"]').click()
-        playwright.expect(first.locator(".result-value")).to_have_text("38", timeout=30_000)
+        playwright.expect(first.locator(".output-content")).to_have_text("38", timeout=30_000)
         assert first.locator(".cell-index").inner_text() == "[1]"
         assert page.locator(".cell").count() == 1
 
@@ -210,9 +214,9 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
         terminal.locator(".cell-kind-select").select_option("markdown")
         playwright.expect(terminal.locator(".markdown-editor")).to_be_visible()
         terminal.locator(".cell-kind-select").select_option("terminal")
-        page.evaluate('globalThis.monaco.editor.getModels()[0].setValue("= `41`")')
+        page.evaluate('globalThis.monaco.editor.getModels().at(-1).setValue("> show: `41`")')
         first.locator('button[aria-label="Run cell"]').click()
-        playwright.expect(first.locator(".result-value")).to_have_text("41", timeout=30_000)
+        playwright.expect(first.locator(".output-content")).to_have_text("41", timeout=30_000)
         terminal.locator("textarea").fill("!python -u -c \"print('stream-ok')\"")
         terminal.locator('button[aria-label="Run command"]').click()
         playwright.expect(terminal.locator(".output-content")).to_contain_text(
@@ -235,8 +239,8 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
         playwright.expect(first.locator(".editor-host")).to_be_visible()
 
         page.evaluate(
-            "globalThis.monaco.editor.getModels()[0].setValue("
-            '"= `(__import__(\\"time\\").sleep(30), 1)[1]`"'
+            "globalThis.monaco.editor.getModels().at(-1).setValue("
+            '"> show: `(__import__(\\"time\\").sleep(30), 1)[1]`"'
             ")"
         )
         first = page.locator(".cell").first
@@ -256,9 +260,9 @@ def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> N
             "Run cell",
         )
 
-        page.evaluate('globalThis.monaco.editor.getModels()[0].setValue("= `7`")')
+        page.evaluate('globalThis.monaco.editor.getModels().at(-1).setValue("> show: `7`")')
         first.locator('button[aria-label="Run cell"]').click()
-        playwright.expect(first.locator(".result-value")).to_have_text("7", timeout=30_000)
+        playwright.expect(first.locator(".output-content")).to_have_text("7", timeout=30_000)
         assert not page_errors
         assert not [
             error
@@ -293,20 +297,20 @@ def test_browser_runtime_uses_vendored_pyodide(notebook_url: str) -> None:
         cell = page.locator(".cell").first
         run_button = cell.locator('button[aria-label="Run cell"]')
         run_button.click()
-        playwright.expect(cell.locator(".result-value")).to_have_text("38", timeout=60_000)
+        playwright.expect(cell.locator(".output-content")).to_have_text("38", timeout=60_000)
 
         page.evaluate(
-            "source => globalThis.monaco.editor.getModels()[0].setValue(source)",
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
             "```\nnumbers = [2, 3]\n```",
         )
         run_button.click()
         playwright.expect(run_button).to_be_enabled(timeout=60_000)
         page.evaluate(
-            "source => globalThis.monaco.editor.getModels()[0].setValue(source)",
-            "```\nnumbers.append(5)\n```\n= `sum(numbers)`",
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            "```\nnumbers.append(5)\n```\n> show: `sum(numbers)`",
         )
         run_button.click()
-        playwright.expect(cell.locator(".result-value")).to_have_text("10", timeout=60_000)
+        playwright.expect(cell.locator(".output-content")).to_have_text("10", timeout=60_000)
 
         assert external_pyodide_requests == []
         browser.close()

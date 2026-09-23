@@ -507,7 +507,7 @@ def create_app(
         from kedi.lsp.features import compute_diagnostics
 
         values, python_values = await asyncio.gather(
-            asyncio.to_thread(compute_diagnostics, payload.source, None),
+            asyncio.to_thread(compute_diagnostics, payload.source, None, interactive=True),
             asyncio.to_thread(_pyright_diagnostics, pyright, payload.source),
         )
         return {

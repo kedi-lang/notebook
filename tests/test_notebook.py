@@ -216,13 +216,13 @@ def test_notebook_api_snapshots_and_restores_kedi_environment_without_secrets(
         ).json()
         resumed = client.post(
             f"/api/notebook/sessions/{restored['sessionId']}/cells/execute",
-            json={"cellId": "resume", "source": "= `value + 22`"},
+            json={"cellId": "resume", "source": "> show: `value + 22`"},
         )
 
     assert captured.status_code == 200
     assert "do-not-export-this" not in captured.text
     assert resumed.status_code == 200
-    assert resumed.json()["result"]["value"] == 42
+    assert resumed.json()["stdout"] == "42\n"
 
 
 def test_notebook_secret_api_rejects_invalid_name_and_missing_dotenv(tmp_path: Path) -> None:
@@ -427,7 +427,7 @@ def test_host_notebook_session_keeps_kedi_and_selected_python_state(tmp_path: Pa
             cell_id="setup",
             source="[value: int] = `40`\n`print('host ready')`",
         )
-        second = session.execute(cell_id="result", source="= `value + 2`")
+        second = session.execute(cell_id="result", source="> show: `value + 2`")
     finally:
         manager.close_all()
 
@@ -436,7 +436,7 @@ def test_host_notebook_session_keeps_kedi_and_selected_python_state(tmp_path: Pa
     assert first["stdout"] == "host ready\n"
     assert second["ok"] is True
     assert second["executionCount"] == 2
-    assert second["result"] == {"kind": "json", "type": "int", "value": 42}
+    assert second["stdout"] == "42\n"
 
 
 def test_host_notebook_terminal_uses_selected_python_and_working_directory(
@@ -536,7 +536,7 @@ def test_browser_notebook_session_uses_long_lived_bridge(tmp_path: Path) -> None
         first = session.execute(cell_id="setup", source="[items: list[int]] = `[1, 2]`")
         second = session.execute(
             cell_id="append",
-            source="`items.append(3)`\n= `items`",
+            source="`items.append(3)`\n> show: `items`",
         )
     finally:
         stop.set()
@@ -544,11 +544,7 @@ def test_browser_notebook_session_uses_long_lived_bridge(tmp_path: Path) -> None
         worker.join(timeout=2)
 
     assert first["ok"] is True
-    assert second["result"] == {
-        "kind": "json",
-        "type": "list",
-        "value": [1, 2, 3],
-    }
+    assert second["stdout"] == "[1, 2, 3]\n"
 
 
 def test_browser_notebook_terminal_uses_existing_bridge(tmp_path: Path) -> None:
@@ -624,7 +620,7 @@ def test_notebook_execution_error_returns_cell_diagnostic(tmp_path: Path) -> Non
     )
     session = manager.create(mode="host", python_id=manager.pythons[0].id)
     try:
-        result = session.execute(cell_id="broken", source="= `1 / 0`")
+        result = session.execute(cell_id="broken", source="> show: `1 / 0`")
     finally:
         manager.close_all()
 
@@ -650,7 +646,7 @@ def test_host_execution_timeout_terminates_worker_and_requests_runtime_reset(
     try:
         result = session.execute(
             cell_id="slow",
-            source="= `(__import__('time').sleep(5), 1)[1]`",
+            source="> show: `(__import__('time').sleep(5), 1)[1]`",
         )
     finally:
         manager.close_all()
@@ -674,7 +670,7 @@ def test_interrupt_closes_running_host_execution_without_deadlock(tmp_path: Path
         result.update(
             session.execute(
                 cell_id="slow",
-                source="= `(__import__('time').sleep(30), 1)[1]`",
+                source="> show: `(__import__('time').sleep(30), 1)[1]`",
             )
         )
 
@@ -703,15 +699,15 @@ def test_terminal_output_and_result_payloads_are_bounded(tmp_path: Path) -> None
         )
         value = session.execute(
             cell_id="large-result",
-            source="= `'x' * 250000`",
+            source="> show: `'x' * 250000`",
         )
     finally:
         manager.close_all()
 
     assert len(str(terminal["stdout"])) < 201_000
     assert str(terminal["stdout"]).endswith("[output truncated by Kedi Notebook]")
-    assert value["result"]["truncated"] is True
-    assert len(str(value["result"]["value"])) < 201_000
+    assert str(value["stdout"]).endswith("[output truncated by Kedi Notebook]")
+    assert len(str(value["stdout"])) < 201_000
 
 
 def test_session_manager_removes_stale_sessions(tmp_path: Path) -> None:
@@ -805,17 +801,17 @@ def test_notebook_lsp_routes_expose_diagnostics_signature_and_definition(
     tmp_path: Path,
 ) -> None:
     app = create_app(cwd=tmp_path)
-    source = "@add(left: int, right: int) -> int:\n  = `left + right`\n\n= <add(1, 2)>"
+    source = "@add(left: int, right: int) -> int:\n  = `left + right`\n\n> show: <add(1, 2)>"
 
     with TestClient(app, base_url="http://127.0.0.1") as client:
         diagnostics = client.post("/api/lsp/diagnostics", json={"source": source})
         signature = client.post(
             "/api/lsp/signature",
-            json={"source": source, "line": 3, "character": 7},
+            json={"source": source, "line": 3, "character": 13},
         )
         definition = client.post(
             "/api/lsp/definition",
-            json={"source": source, "line": 3, "character": 4},
+            json={"source": source, "line": 3, "character": 10},
         )
 
     assert diagnostics.status_code == 200
@@ -828,29 +824,29 @@ def test_notebook_lsp_routes_expose_diagnostics_signature_and_definition(
 
 def test_notebook_lsp_routes_expose_completion_references_and_rename(tmp_path: Path) -> None:
     app = create_app(cwd=tmp_path)
-    source = "[value: int] = `1`\n[value] := `value + 1`\n= <value>"
+    source = "[value: int] = `1`\n[value] := `value + 1`\n> show: <value>"
 
     with TestClient(app, base_url="http://127.0.0.1") as client:
         completion = client.post(
             "/api/lsp/completion",
-            json={"source": source, "line": 2, "character": 4},
+            json={"source": source, "line": 2, "character": 10},
         )
         references = client.post(
             "/api/lsp/references",
             json={
                 "source": source,
                 "line": 2,
-                "character": 4,
+                "character": 10,
                 "includeDeclaration": True,
             },
         )
         prepared = client.post(
             "/api/lsp/prepare-rename",
-            json={"source": source, "line": 2, "character": 4},
+            json={"source": source, "line": 2, "character": 10},
         )
         renamed = client.post(
             "/api/lsp/rename",
-            json={"source": source, "line": 2, "character": 4, "newName": "count"},
+            json={"source": source, "line": 2, "character": 10, "newName": "count"},
         )
 
     assert completion.status_code == 200

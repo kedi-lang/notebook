@@ -89,7 +89,7 @@ restoreDraft();
 if (!state.cells.length) {
   addCell(
     "kedi",
-    "[values: list[int]] = `[2, 3, 5]`\n= `sum(value * value for value in values)`",
+    "[values: list[int]] = `[2, 3, 5]`\n> show: `sum(value * value for value in values)`",
   );
 }
 bindEvents();
