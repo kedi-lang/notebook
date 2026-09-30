@@ -61,6 +61,49 @@ def notebook_url(tmp_path: Path) -> Iterator[str]:
             thread.join(timeout=5)
 
 
+def test_notebook_completion_preserves_marker_and_newline(notebook_url: str) -> None:
+    chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    executable = os.environ.get("KEDI_NOTEBOOK_BROWSER")
+    if executable is None and chrome.is_file():
+        executable = str(chrome)
+    with playwright.sync_playwright() as engine:
+        browser = engine.chromium.launch(
+            headless=True,
+            **({"executable_path": executable} if executable else {}),
+        )
+        try:
+            page = browser.new_page()
+            page.goto(notebook_url, wait_until="networkidle", timeout=120_000)
+            page.wait_for_function("() => !!globalThis.monaco?.editor?.getEditors().length")
+            page.evaluate("""() => {
+                const editor = monaco.editor.getEditors()[0];
+                editor.setValue('  > model');
+                editor.setPosition({lineNumber: 1, column: 10});
+                editor.focus();
+                editor.trigger('test', 'editor.action.triggerSuggest', {});
+            }""")
+            suggestions = page.locator(".suggest-widget.visible")
+            playwright.expect(suggestions).to_be_visible()
+            playwright.expect(suggestions).to_contain_text("model")
+            page.keyboard.press("Enter")
+            page.wait_for_function(
+                "() => monaco.editor.getEditors()[0].getValue() === '  > model: '"
+            )
+            for prefix in ("> model:", "`", "```"):
+                page.evaluate("""() => {
+                    const editor = monaco.editor.getEditors()[0];
+                    editor.setValue('');
+                    editor.focus();
+                }""")
+                page.keyboard.type(prefix, delay=40)
+                page.wait_for_timeout(600)
+                playwright.expect(suggestions).not_to_be_visible()
+                page.keyboard.press("Enter")
+                assert page.evaluate("monaco.editor.getEditors()[0].getValue()") == prefix + "\n"
+        finally:
+            browser.close()
+
+
 def test_notebook_cell_lifecycle_streaming_and_interrupt(notebook_url: str) -> None:
     chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
     executable = os.environ.get("KEDI_NOTEBOOK_BROWSER")

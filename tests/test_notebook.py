@@ -926,6 +926,30 @@ def test_notebook_lsp_routes_expose_completion_references_and_rename(tmp_path: P
     assert len(renamed.json()["edits"]) == 3
 
 
+def test_notebook_directive_completion_preserves_source_edits(tmp_path: Path) -> None:
+    app = create_app(cwd=tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/lsp/completion",
+            json={"source": "  > mo", "line": 0, "character": 6},
+        )
+        assert response.status_code == 200
+        item = next(item for item in response.json()["items"] if item["label"] == "model")
+        assert item["detail"] == "Select the model for this lexical scope"
+        assert item["filterText"] == "> model"
+        assert item["textEdit"] == {
+            "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 6}},
+            "newText": "> model: ",
+        }
+        for source in ("> model:", "> model: ", "`", "``", "```"):
+            response = client.post(
+                "/api/lsp/completion",
+                json={"source": source, "line": 0, "character": len(source)},
+            )
+            assert response.status_code == 200
+            assert response.json()["items"] == []
+
+
 def test_notebook_host_package_api_lists_and_validates_requirements(tmp_path: Path) -> None:
     app = create_app(
         cwd=tmp_path,

@@ -361,7 +361,7 @@ async function registerKediLanguage(monaco) {
     },
   });
   monaco.languages.registerCompletionItemProvider("kedi", {
-    triggerCharacters: [">", "<", "[", ":", "."],
+    triggerCharacters: [">", "<", "[", "."],
     async provideCompletionItems(model, position, completionContext, cancellationToken) {
       if (model.isDisposed()) {
         return { suggestions: [] };

@@ -835,7 +835,13 @@ def _completion_payload(value: Any) -> dict[str, Any]:
         "detail": value.detail,
         "insertText": value.insert_text,
         "sortText": value.sort_text,
+        "filterText": value.filter_text,
     }
+    if value.text_edit is not None:
+        payload["textEdit"] = {
+            "range": _range_payload(value.text_edit.range),
+            "newText": value.text_edit.new_text,
+        }
     return {key: item for key, item in payload.items() if item is not None}
 
 
