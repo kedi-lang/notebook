@@ -6,6 +6,8 @@ import subprocess
 import sys
 import threading
 from collections.abc import Mapping, Sequence
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, BinaryIO
 
 from kedi.lsp.python_virtual import compute_python_virtual_document
@@ -29,7 +31,8 @@ class PyrightServer:
         self._lifecycle_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._document_lock = threading.Lock()
-        self._uri = "file:///tmp/kedi-notebook-embedded.py"
+        self._uri = ""
+        self._workspace: TemporaryDirectory[str] | None = None
 
     def hover(self, source: str, line: int, character: int) -> JsonObject | None:
         virtual = compute_python_virtual_document(
@@ -260,9 +263,7 @@ class PyrightServer:
     def close(self) -> None:
         with self._lifecycle_lock:
             process = self._process
-            if process is None:
-                return
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 try:
                     self._request("shutdown", None)
                     self._notify("exit", None)
@@ -272,11 +273,22 @@ class PyrightServer:
             self._process = None
             self._reader = None
             self._document_open = False
+            if self._workspace is not None:
+                self._workspace.cleanup()
+                self._workspace = None
 
     def _ensure_started(self) -> None:
         with self._lifecycle_lock:
             if self._process is not None and self._process.poll() is None:
                 return
+            self._document_open = False
+            if self._workspace is None:
+                self._workspace = TemporaryDirectory(prefix="kedi-notebook-pyright-")
+            workspace = Path(self._workspace.name).resolve()
+            document = workspace / "embedded.py"
+            # A tracked source file keeps references/rename out of imported libraries.
+            document.touch(exist_ok=True)
+            self._uri = document.as_uri()
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -303,7 +315,8 @@ class PyrightServer:
                 "initialize",
                 {
                     "processId": None,
-                    "rootUri": None,
+                    "rootUri": workspace.as_uri(),
+                    "workspaceFolders": [{"uri": workspace.as_uri(), "name": "notebook"}],
                     "capabilities": {
                         "workspace": {"configuration": True},
                     },

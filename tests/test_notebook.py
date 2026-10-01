@@ -1012,6 +1012,23 @@ def test_pyright_completion_references_and_rename_map_embedded_python() -> None:
     assert edits is not None and len(edits) == 2
 
 
+def test_pyright_tracks_only_its_virtual_workspace_and_can_restart() -> None:
+    pyright = PyrightServer(timeout=10)
+    previous_uri = None
+    for _ in range(2):
+        try:
+            assert pyright.diagnostics("```\nvalue: int = 1\n```") == []
+            assert pyright._workspace is not None
+            workspace = Path(pyright._workspace.name).resolve()
+            assert (workspace / "embedded.py").read_text() == ""
+            assert pyright._uri == (workspace / "embedded.py").as_uri()
+            assert pyright._uri != previous_uri
+            previous_uri = pyright._uri
+        finally:
+            pyright.close()
+        assert not workspace.exists()
+
+
 def test_non_loopback_cli_requires_access_token(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         serve_cli(["--host", "0.0.0.0", "--cwd", str(tmp_path), "--no-open"])
