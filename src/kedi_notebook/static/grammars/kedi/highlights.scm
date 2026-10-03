@@ -22,6 +22,8 @@
   ">>" @keyword)
 (raw_invoke_stmt
   "<<" @keyword)
+(return_stmt "=" @keyword.return)
+(return_block_stmt "=" @keyword.return)
 
 ["@" "~" "<" ">"] @punctuation.special
 ["=" ":" "(" ")" "[" "]" "," "|" "->" "*"] @punctuation.delimiter
@@ -46,9 +48,10 @@
 "approval" @keyword
 "codemode" @keyword
 "requires" @keyword
+"budget" @keyword
 "show" @keyword
 "tool" @keyword
-"system" @keyword
+"instructions" @keyword
 "mcp" @keyword
 "settings" @keyword
 "artifacts" @keyword
@@ -65,6 +68,12 @@
 "if" @keyword
 "else" @keyword
 "loop" @keyword
+"task" @keyword
+"await" @keyword
+"send" @keyword
+"interrupt" @keyword
+"task_group" @keyword
+"process" @keyword
 "map" @keyword
 
 ; ----------------------------------------------------------------
@@ -85,6 +94,11 @@
 (assignment_stmt name: (identifier) @variable)
 (assignment_block_stmt name: (identifier) @variable)
 (loop_stmt binder: (identifier) @variable)
+(task_stmt binder: (identifier) @variable)
+(task_stmt subagent: (identifier) @type)
+(await_stmt binder: (identifier) @variable)
+(await_stmt handle: (identifier) @variable)
+(send_stmt handle: (identifier) @variable)
 (param name: (identifier) @variable.parameter)
 (type_field name: (identifier) @property)
 
@@ -168,6 +182,8 @@
 (tool_exception_name name: (identifier) @type)
 (requires_directive name: (identifier) @constant)
 (requirement_name name: (identifier) @constant)
+(budget_field name: (identifier) @property)
+(budget_field value: (budget_integer) @number)
 (history_field name: (identifier) @property)
 (history_field value: (settings_plain_value) @string)
 (history_field value: (inline_python_expr) @string.special)
