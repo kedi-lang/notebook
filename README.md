@@ -16,10 +16,11 @@ uv run --extra notebook kedi notebook
 ```
 
 This uses the checked-out `notebook` submodule and Kedi source rather than a
-published package. For notebook development, use the root virtual environment:
+published package. For notebook development, run from the Kedi repository root
+with the notebook extra and development dependencies installed:
 
 ```bash
-../.venv/bin/python -m pytest tests
+.venv/bin/python -m pytest notebook/tests
 ```
 
 After syncing the extra, both entry points are equivalent:
