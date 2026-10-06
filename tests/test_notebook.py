@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -753,6 +754,66 @@ def test_interrupt_closes_running_host_execution_without_deadlock(tmp_path: Path
     assert not worker.is_alive()
     assert result["ok"] is False
     assert result["runtimeReset"] is True
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_interrupt_cancels_pending_model_and_allows_new_session(
+    tmp_path: Path, parallel: bool
+) -> None:
+    from kedi.agent_adapter.adapters.pydantic import PydanticAdapter
+    from kedi.engine import SequentialEngine, ThreadEngine
+    from pydantic_ai.messages import ModelResponse
+    from pydantic_ai.models.function import FunctionModel
+
+    entered, cleaned = threading.Event(), threading.Event()
+
+    async def respond(messages, info) -> ModelResponse:
+        entered.set()
+        try:
+            await asyncio.sleep(30)
+        finally:
+            cleaned.set()
+        raise AssertionError("The cancelled model must not produce a result")
+
+    engine = ThreadEngine(max_workers=1) if parallel else SequentialEngine()
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+        interactive_options={"adapter": PydanticAdapter(FunctionModel(respond)), "engine": engine},
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    result: dict[str, object] = {}
+    worker = threading.Thread(
+        target=lambda: result.update(
+            session.execute(
+                cell_id="model", source=">> The value is [value: str].\n> show: <value>"
+            )
+        )
+    )
+    closer = threading.Thread(target=lambda: manager.close(session.id))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        closer.start()
+        closer.join(timeout=5)
+        worker.join(timeout=5)
+        assert not closer.is_alive()
+        assert not worker.is_alive()
+        assert cleaned.is_set()
+        assert result["ok"] is False
+        assert result["runtimeReset"] is True
+        assert "interrupted" in str(result["error"])
+        fresh = manager.create(mode="host", python_id=manager.pythons[0].id)
+        rerun = fresh.execute(cell_id="next", source="> show: `41 + 1`")
+        assert rerun["ok"] is True
+        assert rerun["stdout"] == "42\n"
+    finally:
+        manager.close_all()
+        worker.join(timeout=35)
+        if closer.ident is not None:
+            closer.join(timeout=35)
+        engine.shutdown()
 
 
 def test_terminal_output_and_result_payloads_are_bounded(tmp_path: Path) -> None:

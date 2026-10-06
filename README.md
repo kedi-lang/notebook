@@ -102,9 +102,14 @@ Browser mode supports `!pip install`, `!uv add`, `!pip list`, `!echo`, and
 
 Use the square interrupt action while a cell is running. Interrupting replaces
 the active Python worker, so the source remains rerunnable but live runtime
-state is deliberately discarded. Host Kedi and terminal executions also stop
-after 120 seconds; package installation has a 10-minute limit. Idle sessions
-expire after 30 minutes.
+state is deliberately discarded. It also cancels that session's in-flight
+Pydantic AI or LangChain model and async tool work, without cancelling another
+session. Cancellation does not roll back completed effects or forcibly stop
+arbitrary synchronous tool code running in a server thread.
+
+Embedded-Python bridge operations and terminal execution have 120-second
+timeouts; this is not a universal deadline for a complete model-backed cell.
+Package installation has a 10-minute limit. Idle sessions expire after 30 minutes.
 
 Notebook execution is non-transactional. Rerunning a cell is a new execution
 attempt against current state; it does not roll back previous side effects.

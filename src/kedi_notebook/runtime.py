@@ -23,6 +23,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import kedi
+from kedi.agent_adapter.cancellation import RunCancellation, RunCancelled, use_run_cancellation
 from kedi.agent_adapter.model_resolution import pydantic_model_resolution
 from kedi.executors import PlaygroundExecutor, PyodideExecutor
 
@@ -190,6 +191,7 @@ class NotebookSession:
             self.bridge = HostPythonBridge(python.executable, cwd=cwd)
             executor = PlaygroundExecutor(self.bridge, timeout=_EXECUTION_TIMEOUT)
         self._executor = executor
+        self._cancellation = RunCancellation()
         try:
             if session_snapshot is None:
                 self._session = kedi.interactive(
@@ -220,7 +222,10 @@ class NotebookSession:
             self._attempt += 1
             source_name = _notebook_source_name(self.id, self._attempt)
             try:
-                with pydantic_model_resolution(resolve_notebook_model):
+                with (
+                    use_run_cancellation(self._cancellation),
+                    pydantic_model_resolution(resolve_notebook_model),
+                ):
                     result = self._session.execute(source, source_name=source_name)
             except BaseException as exc:
                 payload = execution_error_payload(exc, source_paths={source_name})
@@ -550,6 +555,7 @@ class NotebookSession:
                 return
             self._closed = True
             terminal_process = self._active_terminal_process
+        self._cancellation.cancel()
         if isinstance(self.bridge, BridgeRun):
             self.bridge.cancel()
         else:
@@ -869,7 +875,9 @@ def _requires_runtime_reset(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, (BridgeCancelled, TimeoutError, subprocess.TimeoutExpired)):
+        if isinstance(
+            current, (BridgeCancelled, RunCancelled, TimeoutError, subprocess.TimeoutExpired)
+        ):
             return True
         original = getattr(current, "original", None)
         current = (
