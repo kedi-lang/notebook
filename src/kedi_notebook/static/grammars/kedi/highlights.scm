@@ -60,6 +60,8 @@
 "max_agents" @keyword
 "workflow" @keyword
 "profile" @keyword
+"capability" @keyword
+"defer" @keyword
 "use" @keyword
 "case" @keyword
 "data" @keyword
@@ -136,6 +138,8 @@
 
 (optimize_directive name: (identifier) @label)
 (profile_directive name: (identifier) @label)
+(capability_directive name: (identifier) @label)
+(defer_directive value: ["true" "false"] @constant.builtin)
 (subagent_directive name: (identifier) @label)
 (max_agents_directive value: (positive_integer) @number)
 (workflow_directive

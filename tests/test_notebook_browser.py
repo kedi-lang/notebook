@@ -357,6 +357,27 @@ def test_browser_runtime_uses_vendored_pyodide(notebook_url: str) -> None:
 
         page.evaluate(
             "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            "```\ndefer_tools = False\n```\n"
+            "> capability: evidence:\n"
+            "  > defer: `defer_tools`\n"
+            "  > instructions: Cite the supplied evidence.\n"
+            "> use: evidence\n> show: Capability ready.\n",
+        )
+        run_button.click()
+        playwright.expect(cell.locator(".output-content")).to_have_text(
+            "Capability ready.", timeout=60_000
+        )
+        page.evaluate(
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+            "> instructions: New cell guidance.\n> use: evidence\n> show: Capability reused.\n",
+        )
+        run_button.click()
+        playwright.expect(cell.locator(".output-content")).to_have_text(
+            "Capability reused.", timeout=60_000
+        )
+
+        page.evaluate(
+            "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
             (
                 "> import: filesystem\n"
                 '> show: <write_text_file(`"note.txt"`, `"browser value"`)>\n'
