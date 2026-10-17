@@ -279,9 +279,19 @@ def test_discover_host_pythons_preserves_explicit_virtualenv_path(tmp_path: Path
     assert pythons[0].executable == str(executable.absolute())
 
 
-def test_discover_host_pythons_rejects_explicit_prerelease(
+@pytest.mark.parametrize(
+    ("version", "releaselevel", "message"),
+    [
+        ([3, 14, 0], "candidate", "requires a final Python release"),
+        ([3, 10, 20], "final", "requires Python 3.11 or newer"),
+    ],
+)
+def test_discover_host_pythons_rejects_unsupported_explicit_interpreter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    version: list[int],
+    releaselevel: str,
+    message: str,
 ) -> None:
     executable = tmp_path / "python3.14"
     executable.write_text("", encoding="utf-8")
@@ -290,12 +300,12 @@ def test_discover_host_pythons_rejects_explicit_prerelease(
 
     def metadata(path: Path) -> dict[str, object] | None:
         if path == executable:
-            return {"version": [3, 14, 0], "releaselevel": "candidate"}
+            return {"version": version, "releaselevel": releaselevel}
         return original_metadata(path)
 
     monkeypatch.setattr(notebook_runtime, "_python_metadata", metadata)
 
-    with pytest.raises(ValueError, match="requires a final Python release"):
+    with pytest.raises(ValueError, match=message):
         discover_host_pythons([executable])
 
 

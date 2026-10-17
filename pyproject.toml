@@ -7,7 +7,7 @@ name = "kedi-notebook"
 version = "0.1.0"
 description = "Local interactive notebook for the Kedi Programming Language"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
     "basedpyright>=1.39.6,<1.40",
@@ -47,7 +47,7 @@ kedi = { path = "..", editable = true }
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]

@@ -746,9 +746,9 @@ def discover_host_pythons(explicit: Sequence[str | Path] = ()) -> list[HostPytho
             if is_explicit:
                 raise ValueError("Kedi notebook host execution requires a final Python release")
             continue
-        if (major, minor) < (3, 10):
+        if (major, minor) < (3, 11):
             if is_explicit:
-                raise ValueError("Kedi notebook host execution requires Python 3.10 or newer")
+                raise ValueError("Kedi notebook host execution requires Python 3.11 or newer")
             continue
         version = f"{major}.{minor}.{patch}"
         result.append(
