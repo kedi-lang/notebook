@@ -534,6 +534,7 @@ dev = [
     { name = "basedpyright", specifier = "==1.39.6" },
     { name = "cassetter", extras = ["httpx"], specifier = "==0.5.0" },
     { name = "claude-agent-sdk", specifier = "==0.2.163" },
+    { name = "codex-auth-helper", extras = ["websocket"], specifier = "==1.10.1" },
     { name = "coverage", specifier = "==7.14.1" },
     { name = "dspy", specifier = "==3.4.0" },
     { name = "groq", specifier = "==1.7.0" },
