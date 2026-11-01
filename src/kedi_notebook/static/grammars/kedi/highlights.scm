@@ -59,6 +59,8 @@
 "subagent" @keyword
 "max_agents" @keyword
 "workflow" @keyword
+"mode" @keyword
+"tools" @keyword
 "profile" @keyword
 "capability" @keyword
 "defer" @keyword
@@ -145,6 +147,9 @@
 (workflow_directive
   "workflow" @keyword
   value: (identifier) @constant)
+(workflow_mode_directive value: (identifier) @constant)
+(workflow_tools_directive name: (identifier) @function.call)
+(workflow_tool_name name: (identifier) @function.call)
 (history_directive
   "history" @keyword
   value: (history_plain_value) @string)
