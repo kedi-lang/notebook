@@ -41,6 +41,7 @@
 "package" @keyword
 "auto" @keyword
 "optimize" @keyword
+"evolve" @keyword
 "agent" @keyword
 "adapter" @keyword
 "model" @keyword
@@ -139,6 +140,7 @@
 (eval_metric dataset: (identifier) @variable)
 
 (optimize_directive name: (identifier) @label)
+(evolve_directive name: (identifier) @label)
 (profile_directive name: (identifier) @label)
 (capability_directive name: (identifier) @label)
 (defer_directive value: ["true" "false"] @constant.builtin)
