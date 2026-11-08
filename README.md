@@ -8,16 +8,22 @@ with either browser-owned Pyodide or a selected host Python interpreter.
 
 ## Install and Run
 
-The notebook is currently distributed from a Kedi source checkout. Install its
-local dependencies and start it in one command from the Kedi repository root:
+Install Kedi with the notebook extra and start the notebook:
+
+```bash
+pip install "kedi[notebook]"
+kedi notebook
+```
+
+From a Kedi source checkout, the same command runs the checked-out `notebook`
+submodule and Kedi source:
 
 ```bash
 uv run --extra notebook kedi notebook
 ```
 
-This uses the checked-out `notebook` submodule and Kedi source rather than a
-published package. For notebook development, run from the Kedi repository root
-with the notebook extra and development dependencies installed:
+For notebook development, run from the Kedi repository root with the notebook
+extra and development dependencies installed:
 
 ```bash
 .venv/bin/python -m pytest notebook/tests
