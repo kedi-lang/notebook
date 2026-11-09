@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import stat
 import sys
 import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from kedi_notebook import NotebookSecretStore, NotebookSessionManager, discover_host_pythons
@@ -19,7 +22,7 @@ from kedi_notebook.bridge import BridgeRun
 from kedi_notebook.host_environment import HostEnvironmentManager, PreparedHostEnvironment
 from kedi_notebook.pyright import PyrightServer
 from kedi_notebook.sandbox_worker import handle_request
-from kedi_notebook.server import create_app, serve_cli
+from kedi_notebook.server import _notebook_server, create_app, serve_cli
 
 
 class _PassthroughHostEnvironment:
@@ -551,6 +554,35 @@ def test_host_notebook_python_calls_kedi_procedures(tmp_path: Path) -> None:
     assert "ZeroDivisionError:" in failed["error"]
     assert failed["diagnostic"]["line"] == 1
     assert (after["ok"], after["stdout"]) == (True, "42\n")
+
+
+def test_host_notebook_input_fails_fast_and_keeps_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Reading the bridge's own input used to block until the execution timeout.
+    monkeypatch.setattr(notebook_runtime, "_EXECUTION_TIMEOUT", 20)
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    child = (
+        "import subprocess, sys\n"
+        "code = 'import sys; print(len(sys.stdin.read()))'\n"
+        "print(subprocess.run([sys.executable, '-c', code], capture_output=True, text=True).stdout)"
+    )
+    try:
+        prompt = session.execute(cell_id="prompt", source="```\nname = input('Name: ')\n```")
+        reader = session.execute(cell_id="child", source=f"```\n{child}\n```")
+        after = session.execute(cell_id="after", source="```\nprint('still here')\n```")
+    finally:
+        manager.close_all()
+
+    assert prompt["ok"] is False
+    assert "EOFError: Standard input is not available" in prompt["error"]
+    assert (reader["ok"], reader["stdout"]) == (True, "0\n\n")
+    assert (after["ok"], after["stdout"]) == (True, "still here\n")
 
 
 def test_host_notebook_imports_filesystem_and_reads_written_file(tmp_path: Path) -> None:
@@ -1117,6 +1149,30 @@ def test_pyright_diagnostics_map_embedded_python_back_to_kedi_source() -> None:
     assert diagnostics[0]["range"]["start"] == {"line": 1, "character": 9}
 
 
+def test_pyright_counts_template_reads_as_uses_of_bindings() -> None:
+    source = (
+        "@greet(name: str) -> str:\n"
+        "  = Hello <name>\n"
+        "\n"
+        "[count: int] = `3`\n"
+        ">> There are <count> items.\n"
+        "[who: str] = `'Kedi'`\n"
+        "[literal: str] = `'unused'`\n"
+        "= <greet(<who>)> <greet(literal)>\n"
+    )
+    pyright = PyrightServer(timeout=10)
+    try:
+        diagnostics = pyright.diagnostics(source)
+    finally:
+        pyright.close()
+
+    # `<greet(literal)>` passes the text "literal", so only that binding is unused.
+    assert [diagnostic["message"] for diagnostic in diagnostics] == [
+        'Variable "literal" is not accessed'
+    ]
+    assert diagnostics[0]["range"]["start"]["line"] == 6
+
+
 def test_pyright_completion_references_and_rename_map_embedded_python() -> None:
     source = "```\nmessage = 'hello'\nprint(message)\n```"
     pyright = PyrightServer(timeout=10)
@@ -1160,6 +1216,40 @@ def test_pyright_tracks_only_its_virtual_workspace_and_can_restart() -> None:
 def test_non_loopback_cli_requires_access_token(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         serve_cli(["--host", "0.0.0.0", "--cwd", str(tmp_path), "--no-open"])
+
+
+def test_notebook_server_exit_does_not_wait_for_a_bridge_long_poll(tmp_path: Path) -> None:
+    app = create_app(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    base_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    server = _notebook_server(app, uvicorn.Config(app, log_level="warning"))
+    serving = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+    serving.start()
+    polled: list[httpx.Response] = []
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        created = httpx.post(f"{base_url}/api/notebook/sessions", json={"mode": "browser"})
+        session_url = f"{base_url}/api/notebook/sessions/{created.json()['sessionId']}"
+        request_url = f"{session_url}/bridge/request"
+        polling = threading.Thread(target=lambda: polled.append(httpx.get(request_url, timeout=30)))
+        polling.start()
+        time.sleep(0.5)
+    finally:
+        started = time.monotonic()
+        server.should_exit = True
+        serving.join(timeout=30)
+    polling.join(timeout=30)
+
+    # The bridge holds this request for 20 seconds unless shutdown closes its session first.
+    assert time.monotonic() - started < 5
+    assert polled[0].json() == {"ok": True, "request": None}
 
 
 def test_notebook_api_executes_host_terminal_cell(tmp_path: Path) -> None:

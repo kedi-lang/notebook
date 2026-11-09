@@ -4,6 +4,7 @@ import builtins
 import contextlib
 import io
 import json
+import os
 import sys
 import traceback
 import types
@@ -42,6 +43,26 @@ _CODE_ACTIONS = frozenset({"evaluate_inline", "execute_block", "execute_side_eff
 
 class KediProcedureError(RuntimeError):
     """A Kedi procedure called from Python failed in the notebook runtime."""
+
+
+class _HostStdin(io.TextIOBase):
+    """Standard input of host-runtime code. The notebook cannot answer prompts here."""
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int | None = -1, /) -> str:
+        raise _stdin_unavailable()
+
+    def readline(self, size: int | None = -1, /) -> str:
+        raise _stdin_unavailable()
+
+
+def _stdin_unavailable() -> EOFError:
+    return EOFError(
+        "Standard input is not available in the host Python runtime; "
+        "use the browser runtime to answer input() prompts"
+    )
 
 
 class _KediProcedure:
@@ -316,7 +337,22 @@ def handle_request(request: Mapping[str, Any]) -> dict[str, Any]:
     return response
 
 
+def _reserve_protocol_input() -> None:
+    """Keep the bridge's input on its own descriptor.
+
+    Descriptor 0 then reads nothing, so neither ``input()`` nor a child process can consume
+    bridge messages and block the worker.
+    """
+    global _PROTOCOL_IN
+    _PROTOCOL_IN = os.fdopen(os.dup(0), "r", encoding="utf-8")
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    sys.stdin = _HostStdin()
+
+
 def main() -> None:
+    _reserve_protocol_input()
     while line := _PROTOCOL_IN.readline():
         try:
             request = json.loads(line)

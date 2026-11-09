@@ -106,6 +106,10 @@ working directory, with `!python` and `!pip` bound to the managed environment.
 Browser mode supports `!pip install`, `!uv add`, `!pip list`, `!echo`, and
 `!pwd`. Terminal output streams into the active cell while it runs.
 
+Browser mode answers `input()` prompts in the page. Host mode has no standard input:
+`input()` raises `EOFError` at once and the session keeps running, and child processes
+read end-of-file.
+
 Use the square interrupt action while a cell is running. Interrupting replaces
 the active Python worker, so the source remains rerunnable but live runtime
 state is deliberately discarded. It also cancels that session's in-flight

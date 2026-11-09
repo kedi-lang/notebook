@@ -728,8 +728,25 @@ def serve_cli(argv: Sequence[str] | None = None) -> int:
     import uvicorn
 
     print(f"Kedi notebook: {browser_url}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")
+    _notebook_server(app, config).run()
     return 0
+
+
+def _notebook_server(app: FastAPI, config: Any) -> Any:
+    """A uvicorn server that closes notebook sessions as soon as shutdown starts.
+
+    uvicorn waits for open requests before the lifespan shutdown runs. Without this, a browser
+    bridge long-poll held for a closed page delays exit by up to its 20-second timeout.
+    """
+    import uvicorn
+
+    class NotebookServer(uvicorn.Server):
+        async def shutdown(self, sockets: Any = None) -> None:
+            await asyncio.to_thread(app.state.notebook_manager.close_all)
+            await super().shutdown(sockets)
+
+    return NotebookServer(config)
 
 
 def main() -> None:
