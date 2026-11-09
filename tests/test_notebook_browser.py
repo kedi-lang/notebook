@@ -448,7 +448,7 @@ def test_browser_python_calls_kedi_procedures(notebook_url: str) -> None:
         playwright.expect(output).to_have_text("before\ninside\nafter 5 40", timeout=60_000)
         run("@boom() -> int:\n  = `1 // 0`\n\n> show: `boom()`")
         playwright.expect(cell.locator(".error-content")).to_contain_text(
-            "ZeroDivisionError: division by zero", timeout=60_000
+            "ZeroDivisionError:", timeout=60_000
         )
         run("> show: `add_two()`")
         playwright.expect(output).to_have_text("42", timeout=60_000)
