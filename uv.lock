@@ -560,7 +560,7 @@ dev = [
 
 [[package]]
 name = "kedi-notebook"
-version = "0.1.2"
+version = "0.1.3"
 source = { editable = "." }
 dependencies = [
     { name = "basedpyright" },
@@ -1415,7 +1415,7 @@ wheels = [
 
 [[package]]
 name = "tree-sitter-kedi"
-version = "0.4.6"
+version = "0.4.7"
 source = { editable = "../tree-sitter-kedi" }
 dependencies = [
     { name = "tree-sitter" },
