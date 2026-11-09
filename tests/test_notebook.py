@@ -496,6 +496,62 @@ def test_host_notebook_session_keeps_kedi_and_selected_python_state(tmp_path: Pa
     assert second["stdout"] == "42\n"
 
 
+# Inline Python calls these as it would in normal Kedi; each pair is (source, stdout).
+PROCEDURE_CALL_CELLS = [
+    ("[base: int] = `40`\n@add_two() -> int:\n  = `base + 2`\n", ""),
+    ("> show: `[add_two() for _ in range(2)]`", "[42, 42]\n"),
+    (
+        "@greet(name: str) -> str:\n  = Merhaba <name>\n\n> show: `greet('Kedi') + '!'`",
+        "Merhaba Kedi!\n",
+    ),
+    # The procedure's writes stay; the caller writes back only the bindings it changed.
+    (
+        "[count: int] = `0`\n@bump() -> int:\n  [count] := `count + 1`\n  = `count`\n\n"
+        "> show: `bump() + bump()`\n> show: `count`",
+        "3\n2\n",
+    ),
+    # Output keeps its order, and the caller keeps its own Python names across the call.
+    (
+        "@loud() -> int:\n  `print('inside')`\n  = `1`\n\n"
+        "```\nlocal = 5\nprint('before')\nloud()\nprint('after', local, base)\n```",
+        "before\ninside\nafter 5 40\n",
+    ),
+    (
+        "@boom() -> int:\n  = `1 // 0`\n\n"
+        "```\ntry:\n    boom()\nexcept Exception as error:\n    print(type(error).__name__)\n```",
+        "KediProcedureError\n",
+    ),
+]
+
+
+def test_host_notebook_python_calls_kedi_procedures(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        results = [
+            session.execute(cell_id=f"cell-{index}", source=source)
+            for index, (source, _) in enumerate(PROCEDURE_CALL_CELLS)
+        ]
+        failed = session.execute(cell_id="failed", source="> show: `boom()`")
+        after = session.execute(cell_id="after", source="> show: `add_two()`")
+    finally:
+        manager.close_all()
+
+    assert [(result["ok"], result["stdout"]) for result in results] == [
+        (True, stdout) for _, stdout in PROCEDURE_CALL_CELLS
+    ]
+    # An unhandled failure is the Kedi error itself, with the procedure in its trace.
+    assert failed["ok"] is False
+    assert "in procedure boom" in failed["error"]
+    assert "ZeroDivisionError: division by zero" in failed["error"]
+    assert failed["diagnostic"]["line"] == 1
+    assert (after["ok"], after["stdout"]) == (True, "42\n")
+
+
 def test_host_notebook_imports_filesystem_and_reads_written_file(tmp_path: Path) -> None:
     manager = NotebookSessionManager(
         cwd=tmp_path,

@@ -10,6 +10,7 @@ export class PyodideRuntime {
     this.rejectReady = null;
     this.nextId = 1;
     this.pending = new Map();
+    this.exchanges = new Map();
     this.executionQueue = Promise.resolve();
   }
 
@@ -39,6 +40,7 @@ export class PyodideRuntime {
         stderr: "",
         onStdout: io.onStdout,
         onStderr: io.onStderr,
+        onExchange: io.onExchange,
       });
       this.worker.postMessage({ id, request });
     });
@@ -56,6 +58,7 @@ export class PyodideRuntime {
       pending.reject(error);
     }
     this.pending.clear();
+    this.exchanges.clear();
   }
 
   #ensureWorker() {
@@ -112,6 +115,14 @@ export class PyodideRuntime {
         this.#handleStdin(event.data);
         return;
       }
+      if (event.data?.type === "exchange") {
+        this.#handleExchange(event.data);
+        return;
+      }
+      if (event.data?.type === "exchange_data") {
+        this.#deliverExchange(event.data);
+        return;
+      }
       const pending = this.pending.get(event.data?.id);
       if (!pending) {
         return;
@@ -137,6 +148,47 @@ export class PyodideRuntime {
       this.resolveReady = null;
       this.rejectReady = null;
     });
+  }
+
+  // Worker Python called a Kedi procedure: send its message as the reply to the current
+  // runtime request, then hand the runtime's next request to the waiting worker.
+  async #handleExchange(message) {
+    const control = new Int32Array(message.control);
+    const pending = this.pending.get(message.id);
+    try {
+      if (!pending?.onExchange) {
+        throw new Error("Procedure calls need a notebook runtime connection");
+      }
+      // Output streamed since the last message belongs to the request this one answers.
+      const outgoing = {
+        ...message.message,
+        stdout: pending.stdout || message.message.stdout || "",
+        stderr: pending.stderr || message.message.stderr || "",
+      };
+      pending.stdout = "";
+      pending.stderr = "";
+      const next = await pending.onExchange(outgoing);
+      const bytes = new TextEncoder().encode(JSON.stringify(next));
+      this.exchanges.set(message.id, bytes);
+      Atomics.store(control, 1, bytes.length);
+      Atomics.store(control, 0, 1);
+    } catch {
+      Atomics.store(control, 0, 3);
+    }
+    Atomics.notify(control, 0);
+  }
+
+  #deliverExchange(message) {
+    const control = new Int32Array(message.control);
+    const bytes = this.exchanges.get(message.id);
+    this.exchanges.delete(message.id);
+    if (bytes && bytes.length === message.data.byteLength) {
+      new Uint8Array(message.data).set(bytes);
+      Atomics.store(control, 0, 2);
+    } else {
+      Atomics.store(control, 0, 3);
+    }
+    Atomics.notify(control, 0);
   }
 
   async #handleStdin(message) {

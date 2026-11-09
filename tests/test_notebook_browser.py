@@ -408,6 +408,53 @@ def test_browser_runtime_uses_vendored_pyodide(notebook_url: str) -> None:
         browser.close()
 
 
+def test_browser_python_calls_kedi_procedures(notebook_url: str) -> None:
+    chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    executable = os.environ.get("KEDI_NOTEBOOK_BROWSER")
+    if executable is None and chrome.is_file():
+        executable = str(chrome)
+
+    with playwright.sync_playwright() as engine:
+        browser = engine.chromium.launch(
+            headless=True,
+            **({"executable_path": executable} if executable else {}),
+        )
+        page = browser.new_page(viewport={"width": 1200, "height": 800})
+        page.goto(notebook_url, wait_until="networkidle", timeout=120_000)
+        cell = page.locator(".cell").first
+        run_button = cell.locator('button[aria-label="Run cell"]')
+        output = cell.locator(".output-content").last
+
+        def run(source: str) -> None:
+            page.evaluate(
+                "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+                source,
+            )
+            run_button.click()
+
+        run("[base: int] = `40`\n@add_two() -> int:\n  = `base + 2`\n\n> show: `add_two()`")
+        playwright.expect(output).to_have_text("42", timeout=60_000)
+        run(
+            "[count: int] = `0`\n@bump() -> int:\n  [count] := `count + 1`\n  = `count`\n\n"
+            "> show: `[bump() + bump(), count]`"
+        )
+        playwright.expect(output).to_have_text("[3, 0]", timeout=60_000)
+        run("> show: `count`")
+        playwright.expect(output).to_have_text("2", timeout=60_000)
+        run(
+            "@loud() -> int:\n  `print('inside')`\n  = `1`\n\n"
+            "```\nlocal = 5\nprint('before')\nloud()\nprint('after', local, base)\n```"
+        )
+        playwright.expect(output).to_have_text("before\ninside\nafter 5 40", timeout=60_000)
+        run("@boom() -> int:\n  = `1 // 0`\n\n> show: `boom()`")
+        playwright.expect(cell.locator(".error-content")).to_contain_text(
+            "ZeroDivisionError: division by zero", timeout=60_000
+        )
+        run("> show: `add_two()`")
+        playwright.expect(output).to_have_text("42", timeout=60_000)
+        browser.close()
+
+
 def test_adding_cells_during_execution_keeps_running_cell_and_editor(notebook_url: str) -> None:
     chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
     executable = os.environ.get("KEDI_NOTEBOOK_BROWSER")

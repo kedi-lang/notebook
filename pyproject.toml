@@ -12,7 +12,7 @@ license = "MIT"
 dependencies = [
     "basedpyright>=1.40.2,<1.41",
     "fastapi>=0.162.0,<0.163",
-    "kedi>=0.1.1,<0.2",
+    "kedi>=0.1.2,<0.2",
     "python-dotenv>=1.2.4,<2",
     "uvicorn>=0.54,<0.55",
 ]

@@ -28,8 +28,33 @@ else:
     base_model_type = _BaseModel
 
 _REFERENCE_KEY = "__kedi_notebook_ref__"
+_PROCEDURE_KEY = "__kedi_playground_procedure__"
 _RESPONSE_PREFIX = "__KEDI_NOTEBOOK_RESPONSE__"
 _OBJECT_REGISTRY: dict[str, Any] = {}
+# The bridge protocol keeps the process streams while user output is redirected.
+_PROTOCOL_IN = sys.stdin
+_PROTOCOL_OUT = sys.stdout
+# Output captured by each request being handled; nested requests stack on top.
+_CAPTURES: list[tuple[io.StringIO, io.StringIO]] = []
+# Requests whose Python may write Kedi bindings: only changed values are sent back.
+_CODE_ACTIONS = frozenset({"evaluate_inline", "execute_block", "execute_side_effects"})
+
+
+class KediProcedureError(RuntimeError):
+    """A Kedi procedure called from Python failed in the notebook runtime."""
+
+
+class _KediProcedure:
+    """Calls a Kedi procedure in the notebook runtime and waits for its result."""
+
+    def __init__(self, name: str) -> None:
+        self.__name__ = self.__qualname__ = name
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return _call_procedure(self.__name__, args, kwargs)
+
+    def __repr__(self) -> str:
+        return f"<Kedi procedure {self.__name__}>"
 
 
 class _KediAttrDict(dict[str, Any]):
@@ -47,6 +72,8 @@ class _KediOutput(io.StringIO):
 
 def _from_json(value: Any) -> Any:
     if isinstance(value, dict):
+        if set(value) == {_PROCEDURE_KEY}:
+            return _KediProcedure(value[_PROCEDURE_KEY])
         if set(value) == {_REFERENCE_KEY}:
             handle = value[_REFERENCE_KEY]
             try:
@@ -62,6 +89,8 @@ def _from_json(value: Any) -> Any:
 def _to_json(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, _KediProcedure):
+        return {_PROCEDURE_KEY: value.__name__}
     if callable(value):
         raise TypeError(f"Python callable {value!r} requires an opaque bridge reference")
     if isinstance(value, Mapping):
@@ -132,19 +161,72 @@ def _run_block(namespace: dict[str, Any], code: str, sync_names: list[str]) -> A
     return wrapper()
 
 
-def _serializable_namespace(namespace: Mapping[str, Any], names: list[str]) -> dict[str, Any]:
+def _serializable_namespace(
+    namespace: Mapping[str, Any],
+    names: list[str],
+    installed: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Encode ``names`` for the host, leaving out values still equal to ``installed``."""
     result: dict[str, Any] = {}
     for name in names:
         if name.startswith("_") or name not in namespace:
             continue
         value = namespace[name]
         try:
-            result[name] = _to_json(value)
+            encoded = _to_json(value)
         except TypeError:
             handle = str(id(value))
             _OBJECT_REGISTRY[handle] = value
-            result[name] = {_REFERENCE_KEY: handle}
+            encoded = {_REFERENCE_KEY: handle}
+        if installed is None or name not in installed or installed[name] != encoded:
+            result[name] = encoded
     return result
+
+
+def _send(message: Mapping[str, Any]) -> None:
+    _PROTOCOL_OUT.write(_RESPONSE_PREFIX + json.dumps(message, separators=(",", ":")) + "\n")
+    _PROTOCOL_OUT.flush()
+
+
+def _exchange(message: Mapping[str, Any]) -> dict[str, Any]:
+    _send(message)
+    line = _PROTOCOL_IN.readline()
+    if not line:
+        raise KediProcedureError("The notebook runtime closed during a procedure call")
+    request = json.loads(line)
+    if not isinstance(request, dict):
+        raise TypeError("Sandbox request must be an object")
+    return request
+
+
+def _take(buffer: io.StringIO) -> str:
+    value = buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate()
+    return value
+
+
+def _call_procedure(name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    stdout, stderr = _CAPTURES[-1]
+    message = {
+        "ok": True,
+        "call": {"procedure": name, "args": _to_json(list(args)), "kwargs": _to_json(kwargs)},
+        "stdout": _take(stdout),
+        "stderr": _take(stderr),
+    }
+    # Like a Kedi procedure called from in-process Python, the caller keeps its own view
+    # of the namespace; nested requests install the runtime's values for the procedure.
+    snapshot = dict(_USER_NAMESPACE)
+    try:
+        reply = _exchange(message)
+        while reply.get("operation") != "procedure_result":
+            reply = _exchange(handle_request(reply))
+    finally:
+        _USER_NAMESPACE.clear()
+        _USER_NAMESPACE.update(snapshot)
+    if reply.get("ok") is True:
+        return _from_json(reply.get("result"))
+    raise KediProcedureError(f"{reply.get('errorType') or 'Error'}: {reply.get('error') or ''}")
 
 
 def _initial_namespace() -> dict[str, Any]:
@@ -167,9 +249,8 @@ _USER_NAMESPACE = _initial_namespace()
 
 
 def execute_request(request: Mapping[str, Any]) -> dict[str, Any]:
-    _USER_NAMESPACE.update(
-        {name: _from_json(value) for name, value in request.get("env", {}).items()}
-    )
+    installed = request.get("env", {})
+    _USER_NAMESPACE.update({name: _from_json(value) for name, value in installed.items()})
     action = request["action"]
     code = request["code"]
     sync_names = request.get("syncNames", [])
@@ -207,30 +288,36 @@ def execute_request(request: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "result": _to_json(result),
-        "env": _serializable_namespace(_USER_NAMESPACE, sync_names),
+        "env": _serializable_namespace(
+            _USER_NAMESPACE, sync_names, installed if action in _CODE_ACTIONS else None
+        ),
     }
 
 
 def handle_request(request: Mapping[str, Any]) -> dict[str, Any]:
     stdout = _KediOutput()
     stderr = _KediOutput()
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        try:
-            response = execute_request(request)
-        except Exception as exc:  # noqa: BLE001 - sandbox boundary serializes errors.
-            response = {
-                "ok": False,
-                "errorType": type(exc).__name__,
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            }
+    _CAPTURES.append((stdout, stderr))
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                response = execute_request(request)
+            except Exception as exc:  # noqa: BLE001 - sandbox boundary serializes errors.
+                response = {
+                    "ok": False,
+                    "errorType": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+    finally:
+        _CAPTURES.pop()
     response["stdout"] = stdout.getvalue()
     response["stderr"] = stderr.getvalue()
     return response
 
 
 def main() -> None:
-    for line in sys.stdin:
+    while line := _PROTOCOL_IN.readline():
         try:
             request = json.loads(line)
             if not isinstance(request, dict):
@@ -245,8 +332,7 @@ def main() -> None:
                 "stdout": "",
                 "stderr": "",
             }
-        sys.stdout.write(_RESPONSE_PREFIX + json.dumps(response, separators=(",", ":")) + "\n")
-        sys.stdout.flush()
+        _send(response)
 
 
 if __name__ == "__main__":

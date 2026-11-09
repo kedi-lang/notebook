@@ -13,6 +13,7 @@ void pyodidePromise.then(
 );
 const STDIN_HEADER_BYTES = 16;
 const STDIN_CAPACITY = 1024 * 1024;
+const EXCHANGE_HEADER_BYTES = 8;
 const loadedOptionalPackages = new Set();
 let activeRequestId = null;
 
@@ -182,6 +183,46 @@ globalThis.kediStreamOutput = (stream, text) => {
   });
 };
 
+// Sends a message for the active request and blocks until the runtime's next request.
+// Python uses it to call Kedi procedures. The page owns the notebook connection, so it
+// first reports the reply's length, then copies the reply into a buffer of that size.
+globalThis.kediExchange = (messageJson) => {
+  if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
+    throw new Error(
+      "Calling Kedi procedures from Python requires a cross-origin isolated notebook response",
+    );
+  }
+  const control = new Int32Array(new SharedArrayBuffer(EXCHANGE_HEADER_BYTES));
+  self.postMessage({
+    type: "exchange",
+    id: activeRequestId,
+    message: JSON.parse(String(messageJson)),
+    control: control.buffer,
+  });
+  waitForExchange(control, 1);
+  const data = new SharedArrayBuffer(Atomics.load(control, 1));
+  Atomics.store(control, 0, 0);
+  self.postMessage({
+    type: "exchange_data",
+    id: activeRequestId,
+    data,
+    control: control.buffer,
+  });
+  waitForExchange(control, 2);
+  return new TextDecoder().decode(new Uint8Array(data).slice());
+};
+
+function waitForExchange(control, expected) {
+  Atomics.wait(control, 0, 0);
+  const state = Atomics.load(control, 0);
+  if (state === 3) {
+    throw new Error("The notebook runtime cancelled the procedure call");
+  }
+  if (state !== expected) {
+    throw new Error(`Invalid procedure call state: ${state}`);
+  }
+}
+
 function readStdin() {
   if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
     throw new Error(
@@ -226,11 +267,33 @@ import types
 import typing
 import typing_extensions
 
-from js import kediStreamOutput
+from js import kediExchange, kediStreamOutput
 from pydantic import BaseModel
 
 _REFERENCE_KEY = "__kedi_notebook_ref__"
+_PROCEDURE_KEY = "__kedi_playground_procedure__"
 _OBJECT_REGISTRY = globals().setdefault("__kedi_object_registry", {})
+# Output captured by each request being handled; nested requests stack on top.
+_CAPTURES = []
+# Requests whose Python may write Kedi bindings: only changed values are sent back.
+_CODE_ACTIONS = frozenset({"evaluate_inline", "execute_block", "execute_side_effects"})
+
+
+class KediProcedureError(RuntimeError):
+    """A Kedi procedure called from Python failed in the notebook runtime."""
+
+
+class _KediProcedure:
+    """Calls a Kedi procedure in the notebook runtime and waits for its result."""
+
+    def __init__(self, name):
+        self.__name__ = self.__qualname__ = name
+
+    def __call__(self, *args, **kwargs):
+        return _call_procedure(self.__name__, args, kwargs)
+
+    def __repr__(self):
+        return f"<Kedi procedure {self.__name__}>"
 
 
 class _KediAttrDict(dict):
@@ -243,6 +306,8 @@ class _KediAttrDict(dict):
 
 def _from_json(value):
     if isinstance(value, dict):
+        if set(value) == {_PROCEDURE_KEY}:
+            return _KediProcedure(value[_PROCEDURE_KEY])
         if set(value) == {_REFERENCE_KEY}:
             handle = value[_REFERENCE_KEY]
             try:
@@ -270,6 +335,8 @@ class _KediOutput(io.StringIO):
 def _to_json(value):
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, _KediProcedure):
+        return {_PROCEDURE_KEY: value.__name__}
     if callable(value):
         raise TypeError(f"Python callable {value!r} requires an opaque bridge reference")
     if isinstance(value, dict):
@@ -346,19 +413,53 @@ def _run_block(namespace, code, sync_names):
     return wrapper()
 
 
-def _serializable_namespace(namespace, names):
+def _serializable_namespace(namespace, names, installed=None):
+    """Encode names for the host, leaving out values still equal to installed."""
     result = {}
     for name in names:
         if name.startswith("_") or name not in namespace:
             continue
         value = namespace[name]
         try:
-            result[name] = _to_json(value)
+            encoded = _to_json(value)
         except TypeError:
             handle = str(id(value))
             _OBJECT_REGISTRY[handle] = value
-            result[name] = {_REFERENCE_KEY: handle}
+            encoded = {_REFERENCE_KEY: handle}
+        if installed is None or name not in installed or installed[name] != encoded:
+            result[name] = encoded
     return result
+
+
+def _take(buffer):
+    value = buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate()
+    return value
+
+
+def _call_procedure(name, args, kwargs):
+    stdout, stderr = _CAPTURES[-1]
+    message = {
+        "ok": True,
+        "call": {"procedure": name, "args": _to_json(list(args)), "kwargs": _to_json(kwargs)},
+        "stdout": _take(stdout),
+        "stderr": _take(stderr),
+    }
+    # Like a Kedi procedure called from in-process Python, the caller keeps its own view
+    # of the namespace; nested requests install the runtime's values for the procedure.
+    namespace = globals()["__kedi_user_namespace"]
+    snapshot = dict(namespace)
+    try:
+        reply = json.loads(kediExchange(json.dumps(message)))
+        while reply.get("operation") != "procedure_result":
+            reply = json.loads(kediExchange(json.dumps(_handle_kedi_request(reply))))
+    finally:
+        namespace.clear()
+        namespace.update(snapshot)
+    if reply.get("ok") is True:
+        return _from_json(reply.get("result"))
+    raise KediProcedureError(f"{reply.get('errorType') or 'Error'}: {reply.get('error') or ''}")
 
 
 def _execute_kedi_request(request):
@@ -378,9 +479,8 @@ def _execute_kedi_request(request):
             },
         },
     )
-    namespace.update(
-        {name: _from_json(value) for name, value in request.get("env", {}).items()}
-    )
+    installed = request.get("env", {})
+    namespace.update({name: _from_json(value) for name, value in installed.items()})
     action = request["action"]
     code = request["code"]
     sync_names = request.get("syncNames", [])
@@ -411,27 +511,37 @@ def _execute_kedi_request(request):
     return {
         "ok": True,
         "result": _to_json(result),
-        "env": _serializable_namespace(namespace, sync_names),
+        "env": _serializable_namespace(
+            namespace, sync_names, installed if action in _CODE_ACTIONS else None
+        ),
     }
 
 
-def _execute_kedi_json(request_json):
+def _handle_kedi_request(request):
     stdout = _KediOutput("stdout")
     stderr = _KediOutput("stderr")
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        try:
-            response = _execute_kedi_request(json.loads(request_json))
-        except Exception as exc:
-            response = {
-                "ok": False,
-                "errorType": type(exc).__name__,
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            }
+    _CAPTURES.append((stdout, stderr))
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                response = _execute_kedi_request(request)
+            except Exception as exc:
+                response = {
+                    "ok": False,
+                    "errorType": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+    finally:
+        _CAPTURES.pop()
 
     response["stdout"] = stdout.getvalue()
     response["stderr"] = stderr.getvalue()
-    return json.dumps(response)
+    return response
+
+
+def _execute_kedi_json(request_json):
+    return json.dumps(_handle_kedi_request(json.loads(request_json)))
 `;
 
 self.addEventListener("message", async (event) => {

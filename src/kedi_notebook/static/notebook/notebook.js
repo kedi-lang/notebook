@@ -749,32 +749,54 @@ class BrowserSessionBridge {
           continue;
         }
         const { id, ...request } = payload.request;
+        // A procedure call from Python answers the current runtime request; later output
+        // and the final response belong to the runtime's next request.
+        let currentId = id;
         let outputPosts = Promise.resolve();
         const postOutput = (stream, text) => {
+          const requestId = currentId;
           outputPosts = outputPosts.then(() =>
             fetchJson(
               `/api/notebook/sessions/${this.sessionId}/bridge/output`,
               {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ requestId: id, stream, text }),
+                body: JSON.stringify({ requestId, stream, text }),
               },
             ),
           );
         };
+        const postResponse = async (response) => {
+          await outputPosts;
+          await fetchJson(
+            `/api/notebook/sessions/${this.sessionId}/bridge/response`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ requestId: currentId, response }),
+            },
+          );
+        };
+        const exchange = async (message) => {
+          await postResponse(message);
+          while (this.active) {
+            const next = await fetchJson(
+              `/api/notebook/sessions/${this.sessionId}/bridge/request`,
+            );
+            if (next.request) {
+              const { id: nextId, ...nextRequest } = next.request;
+              currentId = nextId;
+              return nextRequest;
+            }
+          }
+          throw new Error("The notebook runtime closed during a procedure call");
+        };
         const response = await this.runtime.execute(request, {
           onStdout: (text) => postOutput("stdout", text),
           onStderr: (text) => postOutput("stderr", text),
+          onExchange: exchange,
         });
-        await outputPosts;
-        await fetchJson(
-          `/api/notebook/sessions/${this.sessionId}/bridge/response`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ requestId: id, response }),
-          },
-        );
+        await postResponse(response);
       } catch (error) {
         if (this.active) {
           bridgeFailure = error instanceof Error ? error : new Error(String(error));
