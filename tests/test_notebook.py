@@ -1081,9 +1081,16 @@ def test_notebook_lsp_routes_expose_completion_references_and_rename(tmp_path: P
 
     assert completion.status_code == 200
     assert "value" in {item["label"] for item in completion.json()["items"]}
-    assert len(references.json()["references"]) == 3
+    # The use inside `value + 1` is the same binding, so it is found and renamed too.
+    expected = [(0, 1), (1, 1), (1, 12), (2, 9)]
+    assert sorted(_range_starts(references.json()["references"])) == expected
     assert prepared.json()["rename"]["range"]["start"]["line"] == 2
-    assert len(renamed.json()["edits"]) == 3
+    assert sorted(_range_starts(renamed.json()["edits"])) == expected
+    assert {edit["newText"] for edit in renamed.json()["edits"]} == {"count"}
+
+
+def _range_starts(items: list[dict]) -> list[tuple[int, int]]:
+    return [(item["range"]["start"]["line"], item["range"]["start"]["character"]) for item in items]
 
 
 def test_notebook_directive_completion_preserves_source_edits(tmp_path: Path) -> None:
