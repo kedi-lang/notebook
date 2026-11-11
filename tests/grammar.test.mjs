@@ -39,3 +39,36 @@ test("shipped WASM and query support capabilities and deferred Python expression
     parser.delete();
   }
 });
+
+test("shipped WASM parses numeric type arguments and colons inside conditions", async () => {
+  await Parser.init({
+    locateFile: () => fileURLToPath(new URL("vendor/web-tree-sitter.wasm", staticRoot)),
+  });
+  const language = await Language.load(
+    fileURLToPath(new URL("grammars/kedi/tree-sitter-kedi.wasm", staticRoot)),
+  );
+  const parser = new Parser();
+  parser.setLanguage(language);
+  const query = new Query(
+    language,
+    await readFile(new URL("grammars/kedi/highlights.scm", staticRoot), "utf8"),
+  );
+  const tree = parser.parse(
+    "[t: Literal[1, -2.5]] = `1`\n" +
+    "[f: Callable[..., int]] = `len`\n" +
+    "> if: The time <t>:<f> is in the morning\n" +
+    "  > show: morning\n",
+  );
+  try {
+    assert.equal(tree.rootNode.hasError, false);
+    const numbers = query
+      .captures(tree.rootNode)
+      .filter((item) => item.name === "number")
+      .map((item) => item.node.text);
+    assert.deepEqual(numbers, ["1", "-2.5"]);
+  } finally {
+    tree.delete();
+    query.delete();
+    parser.delete();
+  }
+});

@@ -127,6 +127,8 @@
 (type_ref name: (identifier) @type)
 (type_apply name: (identifier) @type)
 (type_string) @string
+(type_number) @number
+(type_ellipsis) @constant.builtin
 
 ; ----------------------------------------------------------------
 ; Validation suite names (after `@test:` / `@eval:`)
