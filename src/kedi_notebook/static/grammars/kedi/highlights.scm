@@ -115,6 +115,9 @@
 (input_segment name: (identifier) @variable)
 (system_angle_segment) @variable
 (call_segment name: (identifier) @function.call)
+(reference_segment name: (identifier) @variable)
+(reference_call name: (identifier) @function.call)
+(reference_segment ["<<" ">>"] @punctuation.special)
 (output_segment
   name: (identifier) @variable.builtin)
 (text_segment) @string

@@ -72,3 +72,36 @@ test("shipped WASM parses numeric type arguments and colons inside conditions", 
     parser.delete();
   }
 });
+
+test("shipped WASM parses and highlights references", async () => {
+  await Parser.init({
+    locateFile: () => fileURLToPath(new URL("vendor/web-tree-sitter.wasm", staticRoot)),
+  });
+  const language = await Language.load(
+    fileURLToPath(new URL("grammars/kedi/tree-sitter-kedi.wasm", staticRoot)),
+  );
+  const parser = new Parser();
+  parser.setLanguage(language);
+  const query = new Query(
+    language,
+    await readFile(new URL("grammars/kedi/highlights.scm", staticRoot), "utf8"),
+  );
+  const tree = parser.parse(
+    ">> Compare <<cat>> with <<image(dog.png)>> [same: bool]\n" +
+    "[caption] << Describe <<cat>>.\n" +
+    "> if: <<cat>> shows a cat\n" +
+    "  > show: yes\n",
+  );
+  try {
+    assert.equal(tree.rootNode.hasError, false);
+    const captures = query.captures(tree.rootNode);
+    const variables = captures.filter((item) => item.name === "variable").map((item) => item.node.text);
+    const calls = captures.filter((item) => item.name === "function.call").map((item) => item.node.text);
+    assert.deepEqual(variables.filter((text) => text === "cat"), ["cat", "cat", "cat"]);
+    assert.ok(calls.includes("image"));
+  } finally {
+    tree.delete();
+    query.delete();
+    parser.delete();
+  }
+});
