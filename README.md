@@ -86,6 +86,13 @@ The bundled `filesystem` module works in both modes: browser mode accesses the
 worker's temporary virtual filesystem, while host mode accesses the notebook
 working directory on disk.
 
+In host mode, `> import: media` values (images, audio, video and documents) move
+between the worker Python and Kedi with their type and name. ``> show: `photo` ``
+displays a PNG, JPEG, GIF or WebP image inline and gives audio (WAV, MP3, OGG,
+FLAC, AAC) a player, up to 5 MB; other media show their label, such as
+`<image cat.png · image/png · 48 KB>`. Saved progress keeps the label, not the
+bytes. Browser mode cannot load media, because Kedi does not run in Pyodide.
+
 Every visible cell keeps its editor when focus moves elsewhere; inactive Kedi
 cells retain syntax highlighting and can be edited or run directly. The cell
 header can convert an individual cell between Kedi, Markdown, and Terminal.

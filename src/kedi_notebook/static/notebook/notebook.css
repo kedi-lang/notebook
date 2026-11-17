@@ -636,6 +636,29 @@ select {
   color: var(--text);
 }
 
+.media-result {
+  margin: 0;
+  max-height: none;
+}
+
+.media-result img {
+  display: block;
+  max-width: 100%;
+  max-height: 480px;
+  border-radius: 4px;
+}
+
+.media-result audio {
+  display: block;
+  width: min(100%, 420px);
+}
+
+.media-result figcaption {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
 .error-content {
   color: var(--danger);
 }

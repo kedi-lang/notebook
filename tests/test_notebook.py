@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import builtins
 import json
 import os
 import socket
@@ -9,6 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -1308,3 +1311,100 @@ def test_notebook_static_route_serves_notebook_ui(tmp_path: Path) -> None:
     assert 'select.className = "cell-kind-select"' in script.text
     assert 'cell.hidden ? "eye" : "eye-off"' in script.text
     assert "cell.executionCount" not in script.text
+
+
+def test_media_results_carry_a_preview_for_images_and_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kedi.media import Audio, Document, Image
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+    )
+    image = notebook_runtime._json_result(Image.from_bytes(png, "image/png"))
+    assert image == {
+        "kind": "media",
+        "type": "Image",
+        "value": Image.from_bytes(png, "image/png").label,
+        "mediaType": "image/png",
+        "data": base64.b64encode(png).decode(),
+    }
+    clip = notebook_runtime._json_result(Audio.from_bytes(b"RIFF....WAVE", "audio/wav"))
+    assert clip is not None and clip["mediaType"] == "audio/wav"
+
+    # A label only: no browser preview, a URL, or bytes over the preview limit.
+    pdf = notebook_runtime._json_result(Document.from_bytes(b"%PDF-1.4\n", "application/pdf"))
+    assert pdf == {"kind": "media", "type": "Document", "value": pdf["value"]}
+    linked = notebook_runtime._json_result(Image.from_url("https://example.com/cat.png"))
+    assert linked is not None and "data" not in linked
+    monkeypatch.setattr(notebook_runtime, "_MEDIA_PREVIEW_LIMIT", 10)
+    large = notebook_runtime._json_result(Image.from_bytes(png, "image/png"))
+    assert large is not None and "data" not in large and large["value"].startswith("<image")
+    assert notebook_runtime._json_result({"plain": 1}) == {
+        "kind": "json",
+        "type": "dict",
+        "value": {"plain": 1},
+    }
+
+
+def test_host_python_media_values_reach_kedi_and_preview(tmp_path: Path) -> None:
+    png = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/"
+        "pLvAAAAAElFTkSuQmCC"
+    )
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        # image() runs in the worker Python; its Image crosses to Kedi with its type.
+        shown = session.execute(
+            cell_id="load",
+            source=(
+                "> import: media\n"
+                f'[photo: Image] = `image("data:image/png;base64,{png}")`\n'
+                "> show: before\n"
+                "> show: `photo`"
+            ),
+        )
+        # The stored value crosses back: save() runs in the worker.
+        saved = session.execute(
+            cell_id="save",
+            source="> import: media\n[path] = <save(`photo`, out/cat.png)>\n> show: <path>",
+        )
+        named = session.execute(cell_id="label", source="> show: `photo.label`")
+    finally:
+        manager.close_all()
+
+    assert shown["ok"] is True and shown["stdout"] == "before\n"
+    assert shown["result"] == {
+        "kind": "displays",
+        "items": [
+            {
+                "kind": "media",
+                "type": "Image",
+                "value": "<image data · image/png · 69 B>",
+                "mediaType": "image/png",
+                "data": png,
+            }
+        ],
+    }
+    assert saved["ok"] is True and str(saved["stdout"]).strip().endswith("out/cat.png")
+    assert (tmp_path / "out" / "cat.png").read_bytes() == base64.b64decode(png)
+    assert named["stdout"] == "<image data · image/png · 69 B>\n"
+
+
+def test_media_results_without_kedi_media_fall_back_to_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_import = builtins.__import__
+
+    def missing_media(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "kedi.media":
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_media)
+    assert notebook_runtime._json_result([1]) == {"kind": "json", "type": "list", "value": [1]}

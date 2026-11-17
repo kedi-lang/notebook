@@ -466,11 +466,12 @@ function appendOutput(article, cell) {
     stdout.setAttribute("aria-live", "polite");
     output.append(stdout);
   }
-  if (cell.result) {
-    const result = document.createElement("pre");
-    result.className = "output-content result-value";
-    result.textContent = formatResult(cell.result);
-    output.append(result);
+  if (cell.result?.kind === "displays") {
+    for (const item of Array.isArray(cell.result.items) ? cell.result.items : []) {
+      output.append(resultElement(item));
+    }
+  } else if (cell.result) {
+    output.append(resultElement(cell.result));
   }
   if (cell.error) {
     const error = document.createElement("pre");
@@ -971,7 +972,7 @@ async function saveNotebook(mode) {
       saved.progress = {
         status: cell.status === "running" ? "draft" : cell.status,
         stdout: cell.stdout,
-        result: cell.result,
+        result: savedResult(cell.result),
         error: cell.error,
       };
     }
@@ -1703,6 +1704,55 @@ function safeMarkdownHref(value) {
   } catch {
     return null;
   }
+}
+
+const PREVIEW_MEDIA_TYPE = /^(image\/(png|jpeg|gif|webp)|audio\/(wav|mpeg|ogg|flac|aac))$/;
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
+function resultElement(result) {
+  if (result?.kind === "media") {
+    return mediaResult(result);
+  }
+  const element = document.createElement("pre");
+  element.className = "output-content result-value";
+  element.textContent = formatResult(result);
+  return element;
+}
+
+function mediaResult(result) {
+  const figure = document.createElement("figure");
+  figure.className = "output-content media-result";
+  const data = typeof result.data === "string" ? result.data : "";
+  if (PREVIEW_MEDIA_TYPE.test(result.mediaType || "") && data && BASE64.test(data)) {
+    const source = `data:${result.mediaType};base64,${data}`;
+    if (result.mediaType.startsWith("image/")) {
+      const image = document.createElement("img");
+      image.src = source;
+      image.alt = String(result.value || "image");
+      figure.append(image);
+    } else {
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.src = source;
+      figure.append(audio);
+    }
+  }
+  const caption = document.createElement("figcaption");
+  caption.textContent = String(result.value || "");
+  figure.append(caption);
+  return figure;
+}
+
+// Saved notebooks keep a media result's label, not its bytes.
+function savedResult(result) {
+  if (result?.kind === "displays" && Array.isArray(result.items)) {
+    return { ...result, items: result.items.map(savedResult) };
+  }
+  if (result?.kind !== "media") {
+    return result;
+  }
+  const { data, mediaType, ...rest } = result;
+  return rest;
 }
 
 function formatResult(result) {

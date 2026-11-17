@@ -214,7 +214,8 @@ def create_app(
             "connect-src 'self' https://cdn.jsdelivr.net; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
             "font-src 'self' data: https://cdn.jsdelivr.net; "
-            "img-src 'self' data:"
+            "img-src 'self' data:; "
+            "media-src 'self' data:"
         )
         response.headers["Cache-Control"] = "no-store" if api else "no-cache"
         return response

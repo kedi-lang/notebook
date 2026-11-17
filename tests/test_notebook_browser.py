@@ -524,3 +524,78 @@ def test_adding_cells_during_execution_keeps_running_cell_and_editor(notebook_ur
         playwright.expect(last.locator(".output-content")).to_have_text("11", timeout=30_000)
         assert page.locator(".cell.active").count() == 1
         browser.close()
+
+
+def test_media_values_preview_and_cross_the_host_bridge(notebook_url: str, tmp_path: Path) -> None:
+    chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    executable = os.environ.get("KEDI_NOTEBOOK_BROWSER")
+    if executable is None and chrome.is_file():
+        executable = str(chrome)
+    png = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/"
+        "pLvAAAAAElFTkSuQmCC"
+    )
+    wav = base64.b64encode(
+        b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00@\x1f\x00\x00\x80>\x00\x00"
+        b"\x02\x00\x10\x00data\x00\x00\x00\x00"
+    ).decode()
+
+    with playwright.sync_playwright() as engine:
+        browser = engine.chromium.launch(
+            headless=True,
+            **({"executable_path": executable} if executable else {}),
+        )
+        page = browser.new_page(viewport={"width": 1200, "height": 800})
+        page_errors: list[str] = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.goto(notebook_url, wait_until="networkidle", timeout=120_000)
+        host = page.locator('#runtime-select option[data-mode="host"]').first
+        page.select_option("#runtime-select", host.get_attribute("value"))
+        cell = page.locator(".cell").first
+        run_button = cell.locator('button[aria-label="Run cell"]')
+        image = cell.locator("figure.media-result img")
+
+        def run(source: str) -> None:
+            page.evaluate(
+                "source => globalThis.monaco.editor.getModels().at(-1).setValue(source)",
+                source,
+            )
+            run_button.click()
+
+        # A media value made in the worker Python reaches Kedi and shows as a preview;
+        # printed text stays in the output above it.
+        run(
+            "> import: media\n"
+            f'[photo: Image] = `image("data:image/png;base64,{png}")`\n'
+            "> show: before\n"
+            "> show: `photo`\n"
+            "> show: `1 + 1`"
+        )
+        playwright.expect(image).to_be_visible(timeout=60_000)
+        assert image.get_attribute("src") == f"data:image/png;base64,{png}"
+        playwright.expect(cell.locator("figure.media-result figcaption")).to_contain_text(
+            "<image data · image/png"
+        )
+        playwright.expect(cell.locator("[data-live-output]")).to_have_text("before\n2\n")
+
+        # A later run sends the stored value back to the worker: save() runs there.
+        run(
+            "> import: media\n"
+            "[path] = <save(`photo`, out/cat.png)>\n"
+            "> show: <path>\n"
+            "> show: `photo`"
+        )
+        playwright.expect(cell.locator("[data-live-output]")).to_contain_text("out/cat.png")
+        playwright.expect(image).to_be_visible(timeout=60_000)
+        assert (tmp_path / "out" / "cat.png").read_bytes() == base64.b64decode(png)
+
+        run(
+            "> import: media\n"
+            f'[clip: Audio] = `audio("data:audio/wav;base64,{wav}")`\n'
+            "> show: `clip`"
+        )
+        audio = cell.locator("figure.media-result audio")
+        playwright.expect(audio).to_be_attached(timeout=60_000)
+        assert audio.get_attribute("src") == f"data:audio/wav;base64,{wav}"
+        assert page_errors == []
+        browser.close()

@@ -16,6 +16,7 @@ import time
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Queue
@@ -45,6 +46,21 @@ _TERMINAL_TIMEOUT = 120.0
 _PACKAGE_INSTALL_TIMEOUT = 600.0
 _EXECUTION_TIMEOUT = 120.0
 _OUTPUT_LIMIT = 200_000
+# A media result is previewed when its bytes are at most this large and the browser can show them.
+_MEDIA_PREVIEW_LIMIT = 5_000_000
+_MEDIA_PREVIEW_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "audio/wav",
+        "audio/mpeg",
+        "audio/ogg",
+        "audio/flac",
+        "audio/aac",
+    }
+)
 
 
 def _notebook_source_name(session_id: str, attempt: int) -> str:
@@ -221,10 +237,12 @@ class NotebookSession:
             self.touch()
             self._attempt += 1
             source_name = _notebook_source_name(self.id, self._attempt)
+            displays: list[dict[str, object]] = []
             try:
                 with (
                     use_run_cancellation(self._cancellation),
                     pydantic_model_resolution(resolve_notebook_model),
+                    _media_displays(displays),
                 ):
                     result = self._session.execute(source, source_name=source_name)
             except BaseException as exc:
@@ -245,7 +263,7 @@ class NotebookSession:
                 "attempt": self._attempt,
                 "executionCount": self._execution_count,
                 "stdout": _truncate_output(self._executor.drain_stdout()),
-                "result": _json_result(result),
+                "result": _cell_result(result, displays),
             }
 
     def execute_terminal(self, *, cell_id: str, source: str) -> dict[str, Any]:
@@ -820,6 +838,9 @@ def _python_metadata(executable: Path) -> dict[str, Any] | None:
 def _json_result(value: object) -> dict[str, object] | None:
     if value is None:
         return None
+    media = _media_result(value)
+    if media is not None:
+        return media
     try:
         serialized = json.dumps(value)
     except (TypeError, ValueError):
@@ -833,6 +854,56 @@ def _json_result(value: object) -> dict[str, object] | None:
             "truncated": True,
         }
     return {"kind": "json", "type": type(value).__name__, "value": value}
+
+
+def _media_displays(displays: list[dict[str, object]]) -> AbstractContextManager[None]:
+    """Collect media shown with ``> show: `value``` as previews instead of printed labels."""
+
+    try:
+        from kedi.display import display_hook
+    except ImportError:  # a Kedi release without display hooks
+        return nullcontext()
+
+    def show(value: object) -> bool:
+        media = _media_result(value)
+        if media is None:
+            return False
+        displays.append(media)
+        return True
+
+    return display_hook(show)
+
+
+def _cell_result(value: object, displays: list[dict[str, object]]) -> dict[str, object] | None:
+    if not displays:
+        return _json_result(value)
+    result = _json_result(value)
+    return {"kind": "displays", "items": [*displays, *([] if result is None else [result])]}
+
+
+def _media_result(value: object) -> dict[str, object] | None:
+    """A media value's label, with its bytes for an image or audio the browser can preview."""
+
+    try:
+        from kedi.media import as_media
+    except ImportError:  # a Kedi release without media values
+        return None
+    media = as_media(value)
+    if media is None:
+        return None
+    result: dict[str, object] = {
+        "kind": "media",
+        "type": type(media).__name__,
+        "value": media.label,
+    }
+    if (
+        media.data is not None
+        and media.media_type in _MEDIA_PREVIEW_TYPES
+        and len(media.data) <= _MEDIA_PREVIEW_LIMIT
+    ):
+        result["mediaType"] = media.media_type
+        result["data"] = base64.b64encode(media.data).decode("ascii")
+    return result
 
 
 class _BoundedText:

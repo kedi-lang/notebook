@@ -30,6 +30,7 @@ else:
 
 _REFERENCE_KEY = "__kedi_notebook_ref__"
 _PROCEDURE_KEY = "__kedi_playground_procedure__"
+_MEDIA_KEY = "__kedi_media__"  # kedi.media.BRIDGE_KEY
 _RESPONSE_PREFIX = "__KEDI_NOTEBOOK_RESPONSE__"
 _OBJECT_REGISTRY: dict[str, Any] = {}
 # The bridge protocol keeps the process streams while user output is redirected.
@@ -95,6 +96,12 @@ def _from_json(value: Any) -> Any:
     if isinstance(value, dict):
         if set(value) == {_PROCEDURE_KEY}:
             return _KediProcedure(value[_PROCEDURE_KEY])
+        if set(value) == {_MEDIA_KEY}:
+            try:
+                from kedi.media import from_bridge
+            except ImportError as exc:
+                raise RuntimeError("Media values need Kedi installed in this Python") from exc
+            return from_bridge(value[_MEDIA_KEY])
         if set(value) == {_REFERENCE_KEY}:
             handle = value[_REFERENCE_KEY]
             try:
@@ -112,6 +119,10 @@ def _to_json(value: Any) -> Any:
         return value
     if isinstance(value, _KediProcedure):
         return {_PROCEDURE_KEY: value.__name__}
+    # A media value exists only once kedi.media is imported; never import Kedi here otherwise.
+    media = sys.modules.get("kedi.media")
+    if media is not None and isinstance(value, media.Media):
+        return media.to_bridge(value)
     if callable(value):
         raise TypeError(f"Python callable {value!r} requires an opaque bridge reference")
     if isinstance(value, Mapping):
@@ -132,6 +143,9 @@ def _type_descriptor(value: Any) -> dict[str, Any]:
         return {"kind": "builtin", "name": value.__qualname__}
     if value is typing.Any:
         return {"kind": "typing", "name": "Any"}
+    media = sys.modules.get("kedi.media")
+    if media is not None and isinstance(value, type) and issubclass(value, media.Media):
+        return {"kind": "media", "name": value.__name__}
     if (
         base_model_type is not None
         and isinstance(value, type)
