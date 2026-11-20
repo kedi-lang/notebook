@@ -515,3 +515,54 @@ def test_pyodide_driver_setup_matches_sandbox_worker_fixes() -> None:
         )
     assert len(registry) <= driver["_MAX_OBJECT_REGISTRY"]
     assert first_handle not in registry
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "payload"),
+    [
+        ("hover", "/api/lsp/hover", {"source": "x = 1", "line": 0, "character": 0}),
+        (
+            "completion",
+            "/api/lsp/completion",
+            {"source": "x = 1", "line": 0, "character": 0},
+        ),
+        (
+            "references",
+            "/api/lsp/references",
+            {"source": "x = 1", "line": 0, "character": 0, "includeDeclaration": True},
+        ),
+        (
+            "prepare_rename",
+            "/api/lsp/prepare-rename",
+            {"source": "x = 1", "line": 0, "character": 0},
+        ),
+        (
+            "rename",
+            "/api/lsp/rename",
+            {"source": "x = 1", "line": 0, "character": 0, "newName": "y"},
+        ),
+    ],
+)
+def test_lsp_endpoints_fall_back_to_kedi_when_pyright_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    path: str,
+    payload: dict,
+) -> None:
+    from kedi_notebook import pyright as pyright_module
+
+    def failing(self, *args, **kwargs):
+        raise RuntimeError(f"Pyright request timed out: {method}")
+
+    monkeypatch.setattr(pyright_module.PyrightServer, method, failing)
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1", raise_server_exceptions=False) as client:
+        response = client.post(path, json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "kedi"

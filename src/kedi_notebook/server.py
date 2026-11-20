@@ -470,7 +470,7 @@ def create_app(
         from kedi.lsp.features import compute_hover
         from lsprotocol import types as lsp
 
-        python_hover = await asyncio.to_thread(
+        python_hover = await _pyright_call(
             pyright.hover,
             payload.source,
             payload.line,
@@ -537,7 +537,7 @@ def create_app(
         from kedi.lsp.features import compute_completion
         from lsprotocol import types as lsp
 
-        python_items = await asyncio.to_thread(
+        python_items = await _pyright_call(
             pyright.completion,
             payload.source,
             payload.line,
@@ -614,7 +614,7 @@ def create_app(
         from kedi.lsp.features import compute_references
         from lsprotocol import types as lsp
 
-        python_locations = await asyncio.to_thread(
+        python_locations = await _pyright_call(
             pyright.references,
             payload.source,
             payload.line,
@@ -642,7 +642,7 @@ def create_app(
         from kedi.lsp.features import compute_prepare_rename
         from lsprotocol import types as lsp
 
-        python_result = await asyncio.to_thread(
+        python_result = await _pyright_call(
             pyright.prepare_rename,
             payload.source,
             payload.line,
@@ -667,7 +667,7 @@ def create_app(
         from kedi.lsp.features import compute_rename
         from lsprotocol import types as lsp
 
-        python_edits = await asyncio.to_thread(
+        python_edits = await _pyright_call(
             pyright.rename,
             payload.source,
             payload.line,
@@ -899,6 +899,18 @@ def _pyright_diagnostics(pyright: PyrightServer, source: str) -> list[dict[str, 
         return pyright.diagnostics(source)
     except (OSError, RuntimeError, subprocess.SubprocessError):
         return []
+
+
+async def _pyright_call(func: Any, *args: Any, **kwargs: Any) -> Any | None:
+    """Run a Pyright call, falling back to the Kedi provider on failure.
+
+    A dead or timed-out language server must not turn an LSP endpoint into
+    a 500; the caller treats ``None`` as "no Pyright answer".
+    """
+    try:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None
 
 
 def _is_loopback_host(host: str) -> bool:
