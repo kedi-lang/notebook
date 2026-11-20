@@ -2,6 +2,7 @@
 
 Each test fails on the base commit (9aa4d50) and passes with the fix.
 """
+
 from __future__ import annotations
 
 import os
@@ -38,9 +39,7 @@ PROCESS_CONTROL_NAMES = [
 
 
 @pytest.mark.parametrize("name", PROCESS_CONTROL_NAMES)
-def test_secret_store_rejects_process_control_names(
-    tmp_path: Path, name: str
-) -> None:
+def test_secret_store_rejects_process_control_names(tmp_path: Path, name: str) -> None:
     store = NotebookSecretStore(tmp_path / "secrets.json")
     saved = os.environ.get(name)
     try:
@@ -176,8 +175,6 @@ def _run_live_notebook_server(tmp_path: Path):
 
 
 def test_chunked_body_over_limit_gets_413(tmp_path: Path) -> None:
-    import json
-
     import httpx
 
     server, thread, base = _run_live_notebook_server(tmp_path)
@@ -299,11 +296,7 @@ def test_host_worker_ignores_forged_fd1_reply(tmp_path: Path) -> None:
                 "stderr": "",
             }
         )
-        code = (
-            "import os\n"
-            f"os.write(1, ({forged!r} + chr(10)).encode())\n"
-            "x = 'real-result'\n"
-        )
+        code = f"import os\nos.write(1, ({forged!r} + chr(10)).encode())\nx = 'real-result'\n"
         reply = bridge.request(
             {"action": "execute_block", "code": code, "syncNames": ["x"]},
             timeout=10,
@@ -566,3 +559,45 @@ def test_lsp_endpoints_fall_back_to_kedi_when_pyright_fails(
 
     assert response.status_code == 200
     assert response.json()["provider"] == "kedi"
+
+
+def test_secret_store_keeps_concurrent_updates(tmp_path: Path) -> None:
+    store = NotebookSecretStore(tmp_path / "secrets.json")
+    barrier = threading.Barrier(4)
+
+    def setter(index: int) -> None:
+        barrier.wait()
+        store.set_many({f"T{index}K{number}": "v" for number in range(50)})
+
+    threads = [threading.Thread(target=setter, args=(index,)) for index in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(store.names) == 200
+    assert len(NotebookSecretStore(tmp_path / "secrets.json").names) == 200
+
+
+def test_secret_store_refuses_a_write_it_could_not_read_back(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "secrets.json"
+    store = NotebookSecretStore(path)
+    with pytest.raises(ValueError, match="exceed 1 MB"):
+        store.set_many({f"big{index}": "B" * 128_000 for index in range(9)})
+    # The rejected write left the store readable instead of bricking it.
+    assert NotebookSecretStore(path).names == ()
+
+
+def test_secret_store_refuses_to_read_through_a_symlink(tmp_path: Path) -> None:
+    victim = tmp_path / "victim.json"
+    victim.write_text(
+        '{"version": 1, "secrets": {"SOME_KEY": "some-value"}}',
+        encoding="utf-8",
+    )
+    link = tmp_path / "secrets.json"
+    link.symlink_to(victim)
+    with pytest.raises(RuntimeError, match="symbolic link"):
+        NotebookSecretStore(link)
+    assert victim.read_text(encoding="utf-8").startswith('{"version": 1')

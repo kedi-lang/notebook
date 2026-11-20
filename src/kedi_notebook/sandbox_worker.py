@@ -34,6 +34,8 @@ _REFERENCE_KEY = "__kedi_notebook_ref__"
 _PROCEDURE_KEY = "__kedi_playground_procedure__"
 _MEDIA_KEY = "__kedi_media__"  # kedi.media.BRIDGE_KEY
 _RESPONSE_PREFIX = "__KEDI_NOTEBOOK_RESPONSE__"
+
+
 def _protocol_fd() -> int:
     try:
         return int(os.environ.get("KEDI_NOTEBOOK_PROTOCOL_FD", "3"))
@@ -136,8 +138,7 @@ def _to_json(value: Any, _seen: frozenset[int] | None = None, _depth: int = 0) -
         return value
     if _depth > _MAX_JSON_DEPTH:
         raise TypeError(
-            f"Python value {type(value).__name__} is nested too deeply "
-            "to cross the sandbox bridge"
+            f"Python value {type(value).__name__} is nested too deeply to cross the sandbox bridge"
         )
     if isinstance(value, _KediProcedure):
         return {_PROCEDURE_KEY: value.__name__}
@@ -255,8 +256,7 @@ def _indent_block_lines(code: str) -> list[str]:
         # Unparseable code: indent everything and let compile() report it.
         string_rows = set()
     return [
-        f"    {line}" if index + 1 not in string_rows else line
-        for index, line in enumerate(lines)
+        f"    {line}" if index + 1 not in string_rows else line for index, line in enumerate(lines)
     ]
 
 

@@ -922,8 +922,7 @@ def _sanitize_json(value: object, _seen: frozenset[int] | None = None) -> Any:
             raise TypeError("Circular reference cannot cross the notebook bridge")
         seen = seen | {id(value)}
         return {
-            _sanitize_json(key, seen): _sanitize_json(item, seen)
-            for key, item in value.items()
+            _sanitize_json(key, seen): _sanitize_json(item, seen) for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
         seen = _seen or frozenset()
