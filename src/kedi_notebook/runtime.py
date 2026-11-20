@@ -21,6 +21,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Queue
+from secrets import token_hex
 from typing import Any, Final, Literal
 from uuid import uuid4
 
@@ -91,6 +92,10 @@ class HostPythonBridge:
         self._request_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._closed = False
+        # Every reply from the worker must carry this nonce. User code can
+        # write to fd 1, but it never sees the nonce, so a forged protocol
+        # line is ignored instead of being accepted as the next response.
+        self._nonce = token_hex(16)
         self._process = subprocess.Popen(
             [executable, "-u", str(_WORKER)],
             stdin=subprocess.PIPE,
@@ -116,16 +121,29 @@ class HostPythonBridge:
             stdout = process.stdout
             if process.poll() is not None:
                 raise RuntimeError(self._worker_error("Host Python worker exited"))
-            process.stdin.write(json.dumps(dict(payload), separators=(",", ":")) + "\n")
+            request_payload = {"nonce": self._nonce, **dict(payload)}
+            process.stdin.write(json.dumps(request_payload, separators=(",", ":")) + "\n")
             process.stdin.flush()
-            response_queue: Queue[tuple[str, str | BaseException | None]] = Queue(maxsize=1)
+            response_queue: Queue[tuple[str, dict[str, Any] | BaseException | None]] = Queue(
+                maxsize=1
+            )
 
             def read_response() -> None:
                 try:
                     for line in stdout:
-                        if line.startswith(_RESPONSE_PREFIX):
-                            response_queue.put(("response", line.removeprefix(_RESPONSE_PREFIX)))
-                            return
+                        if not line.startswith(_RESPONSE_PREFIX):
+                            continue
+                        try:
+                            candidate = json.loads(line.removeprefix(_RESPONSE_PREFIX))
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(candidate, dict) or candidate.get("nonce") != self._nonce:
+                            # A forged line written to fd 1 by user code, or a
+                            # malformed line: never a protocol reply.
+                            continue
+                        candidate.pop("nonce", None)
+                        response_queue.put(("response", candidate))
+                        return
                     response_queue.put(("closed", None))
                 except BaseException as exc:  # Worker pipe boundary.
                     response_queue.put(("error", exc))
@@ -148,10 +166,9 @@ class HostPythonBridge:
                 if interrupted:
                     raise BridgeCancelled("Host Python worker was interrupted")
                 raise RuntimeError(self._worker_error("Host Python worker returned no response"))
-            response = json.loads(str(value))
-            if not isinstance(response, dict):
+            if not isinstance(value, dict):
                 raise TypeError("Host Python worker response must be an object")
-            return response
+            return value
 
     def close(self) -> None:
         with self._state_lock:

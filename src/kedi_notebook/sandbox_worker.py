@@ -40,6 +40,9 @@ _PROTOCOL_OUT = sys.stdout
 _CAPTURES: list[tuple[io.StringIO, io.StringIO]] = []
 # Requests whose Python may write Kedi bindings: only changed values are sent back.
 _CODE_ACTIONS = frozenset({"evaluate_inline", "execute_block", "execute_side_effects"})
+# Nonce of the request being handled; every protocol reply carries it, so the
+# host can tell its own replies apart from lines user code wrote to fd 1.
+_CURRENT_NONCE: str | None = None
 
 
 class KediProcedureError(RuntimeError):
@@ -219,7 +222,10 @@ def _serializable_namespace(
 
 
 def _send(message: Mapping[str, Any]) -> None:
-    _PROTOCOL_OUT.write(_RESPONSE_PREFIX + json.dumps(message, separators=(",", ":")) + "\n")
+    payload: Mapping[str, Any] = (
+        {"nonce": _CURRENT_NONCE, **message} if _CURRENT_NONCE is not None else message
+    )
+    _PROTOCOL_OUT.write(_RESPONSE_PREFIX + json.dumps(payload, separators=(",", ":")) + "\n")
     _PROTOCOL_OUT.flush()
 
 
@@ -366,12 +372,15 @@ def _reserve_protocol_input() -> None:
 
 
 def main() -> None:
+    global _CURRENT_NONCE
     _reserve_protocol_input()
     while line := _PROTOCOL_IN.readline():
         try:
             request = json.loads(line)
             if not isinstance(request, dict):
                 raise TypeError("Sandbox request must be an object")
+            nonce = request.get("nonce")
+            _CURRENT_NONCE = nonce if isinstance(nonce, str) else None
             response = handle_request(request)
         except Exception as exc:  # noqa: BLE001 - line protocol must stay alive.
             response = {

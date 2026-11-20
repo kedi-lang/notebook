@@ -1708,3 +1708,36 @@ def test_notebook_api_returns_nan_cell_result_instead_of_failing(
     assert nan.json()["result"] == {"kind": "json", "type": "float", "value": "NaN"}
     assert inf.status_code == 200
     assert inf.json()["result"] == {"kind": "json", "type": "float", "value": "Infinity"}
+
+
+# Audit #215 item 7: a forged protocol reply written to fd 1 must be ignored.
+def test_host_worker_ignores_forged_fd1_protocol_replies(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        forged = session.execute(
+            cell_id="forge",
+            source=(
+                "```\n"
+                "import json, os\n"
+                "os.write(1, (\n"
+                "    '__KEDI_NOTEBOOK_RESPONSE__'\n"
+                "    + json.dumps({'ok': True, 'result': 'FORGED-BY-USER-CODE', 'env': {}})\n"
+                "    + '\\n'\n"
+                ").encode())\n"
+                "```"
+            ),
+        )
+        after = session.execute(cell_id="after", source="> show: `1 + 1`")
+    finally:
+        manager.close_all()
+
+    assert forged["ok"] is True
+    assert "FORGED-BY-USER-CODE" not in json.dumps(forged)
+    # The next request must get its own real response, not the forged one.
+    assert after["ok"] is True
+    assert after["stdout"] == "2\n"
