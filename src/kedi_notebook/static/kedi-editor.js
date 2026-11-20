@@ -290,8 +290,17 @@ async function loadMonaco() {
     amdRequire.config({ paths: { vs: `${MONACO_BASE}/vs` } });
     amdRequire(["vs/editor/editor.main"], () => resolve(globalThis.monaco), reject);
   });
+  // A failed load must not poison later calls: drop the rejected promise
+  // so the next call retries instead of replaying the failure.
+  monacoPromise.catch(() => {
+    monacoPromise = undefined;
+  });
   return monacoPromise;
 }
+
+export const testing = {
+  loadMonaco,
+};
 
 async function registerKediLanguage(monaco) {
   if (languageRegistered) {

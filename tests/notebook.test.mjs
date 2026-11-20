@@ -211,3 +211,102 @@ test("ensureOptionalPackages no longer substring-matches the request", () => {
   assert.match(fn, /requestImportsPackage\(request, "pydantic_monty"\)/);
   assert.match(fn, /requestImportsPackage\(request, "logfire"\)/);
 });
+
+test("tree-sitter resources retry after a failed load", async () => {
+  let fetchCalls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("network down");
+  };
+  try {
+    const { createKediTreeSitterHighlighter } = await import(
+      "../src/kedi_notebook/static/tree-sitter-highlighter.js"
+    );
+    await assert.rejects(createKediTreeSitterHighlighter(), /network down/);
+    const afterFirst = fetchCalls;
+    assert.ok(afterFirst > 0, "first load attempted a fetch");
+    await assert.rejects(createKediTreeSitterHighlighter(), /network down/);
+    assert.ok(
+      fetchCalls > afterFirst,
+      "second call retried the load instead of replaying the cached rejection",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("Monaco loader retries after a failed load", async () => {
+  const editorSource = await readFile(
+    new URL("../src/kedi_notebook/static/kedi-editor.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(editorSource, /export const testing = \{\s*loadMonaco,\s*\}/);
+  // Extract loadMonaco with its module-scope state instead of importing
+  // the editor module (which preloads tree-sitter resources at import).
+  const loadMonaco = new Function(
+    `
+    let monacoPromise;
+    let workerUrl;
+    const MONACO_BASE = "https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min";
+    ${extractFunction(editorSource, "loadMonaco")}
+    return loadMonaco;
+    `,
+  )();
+  let attempts = 0;
+  const realRequire = globalThis.require;
+  globalThis.require = (modules, onOk, onErr) => {
+    attempts += 1;
+    if (attempts === 1) {
+      onErr(new Error("CDN down"));
+    } else {
+      globalThis.monaco = { marker: true };
+      onOk(globalThis.monaco);
+    }
+  };
+  globalThis.require.config = () => {};
+  try {
+    await assert.rejects(loadMonaco(), /CDN down/);
+    const monaco = await loadMonaco();
+    assert.equal(monaco.marker, true);
+    assert.equal(attempts, 2);
+  } finally {
+    globalThis.require = realRequire;
+    delete globalThis.monaco;
+  }
+});
+
+test("execute after dispose rejects cleanly without leaking the pending entry", async () => {
+  const { PyodideRuntime } = await import(
+    "../src/kedi_notebook/static/pyodide-runtime.js"
+  );
+  // Stub Worker: emits "ready" from a queued microtask (the listener is
+  // attached after construction, so a synchronous emit would be lost).
+  const realWorker = globalThis.Worker;
+  globalThis.Worker = class {
+    constructor() {
+      this.listeners = {};
+      queueMicrotask(() => this.emit("message", { data: { type: "ready" } }));
+    }
+    addEventListener(type, fn) {
+      (this.listeners[type] ??= []).push(fn);
+    }
+    emit(type, event) {
+      (this.listeners[type] ?? []).forEach((fn) => fn(event));
+    }
+    postMessage() {}
+    terminate() {}
+  };
+  try {
+    const runtime = new PyodideRuntime(() => {});
+    await runtime.preload();
+    const pending = runtime.execute({ action: "evaluate_inline", code: "1+1" });
+    // dispose() lands inside #execute's await-preload window.
+    queueMicrotask(() => runtime.dispose());
+    await assert.rejects(pending, /Pyodide worker was terminated/);
+    assert.equal(runtime.pending.size, 0);
+    assert.equal(runtime.worker, null);
+  } finally {
+    globalThis.Worker = realWorker;
+  }
+});

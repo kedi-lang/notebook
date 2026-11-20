@@ -42,6 +42,14 @@ export class PyodideRuntime {
         onStderr: io.onStderr,
         onExchange: io.onExchange,
       });
+      if (!this.worker) {
+        // dispose() landed between the preload await and this post: the
+        // worker is gone, so reject cleanly and drop the pending entry
+        // instead of throwing a TypeError on a null worker.
+        this.pending.delete(id);
+        reject(new Error("Pyodide worker was terminated"));
+        return;
+      }
       this.worker.postMessage({ id, request });
     });
   }

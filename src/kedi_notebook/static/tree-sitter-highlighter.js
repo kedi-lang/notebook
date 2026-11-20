@@ -215,6 +215,11 @@ async function loadResources() {
         injectionQuery: new Query(kediLanguage, kediInjections),
       };
     })();
+    // A failed load must not poison later calls: drop the rejected
+    // promise so the next call retries instead of replaying the failure.
+    resourcesPromise.catch(() => {
+      resourcesPromise = undefined;
+    });
   }
   return resourcesPromise;
 }
