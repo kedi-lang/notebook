@@ -32,6 +32,14 @@ _REFERENCE_KEY = "__kedi_notebook_ref__"
 _PROCEDURE_KEY = "__kedi_playground_procedure__"
 _MEDIA_KEY = "__kedi_media__"  # kedi.media.BRIDGE_KEY
 _RESPONSE_PREFIX = "__KEDI_NOTEBOOK_RESPONSE__"
+def _protocol_fd() -> int:
+    try:
+        return int(os.environ.get("KEDI_NOTEBOOK_PROTOCOL_FD", "3"))
+    except ValueError:
+        return 3
+
+
+_PROTOCOL_FD = _protocol_fd()
 _OBJECT_REGISTRY: dict[str, Any] = {}
 # The bridge protocol keeps the process streams while user output is redirected.
 _PROTOCOL_IN = sys.stdin
@@ -351,22 +359,33 @@ def handle_request(request: Mapping[str, Any]) -> dict[str, Any]:
     return response
 
 
-def _reserve_protocol_input() -> None:
-    """Keep the bridge's input on its own descriptor.
+def _reserve_protocol_fds() -> None:
+    """Keep the bridge protocol on its own descriptors.
 
     Descriptor 0 then reads nothing, so neither ``input()`` nor a child process can consume
-    bridge messages and block the worker.
+    bridge messages and block the worker. Descriptor 1 is pointed at /dev/null, so a raw
+    ``os.write(1, ...)`` from user code cannot forge a protocol reply: replies travel on
+    a dedicated pipe (descriptor 3) that user code is never handed.
     """
-    global _PROTOCOL_IN
+    global _PROTOCOL_IN, _PROTOCOL_OUT
     _PROTOCOL_IN = os.fdopen(os.dup(0), "r", encoding="utf-8")
     devnull = os.open(os.devnull, os.O_RDONLY)
     os.dup2(devnull, 0)
     os.close(devnull)
+    try:
+        _PROTOCOL_OUT = os.fdopen(_PROTOCOL_FD, "w", encoding="utf-8")
+    except OSError:
+        # No dedicated pipe (started by hand): fall back to stdout.
+        _PROTOCOL_OUT = sys.stdout
+    else:
+        devnull_w = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_w, 1)
+        os.close(devnull_w)
     sys.stdin = _HostStdin()
 
 
 def main() -> None:
-    _reserve_protocol_input()
+    _reserve_protocol_fds()
     while line := _PROTOCOL_IN.readline():
         try:
             request = json.loads(line)

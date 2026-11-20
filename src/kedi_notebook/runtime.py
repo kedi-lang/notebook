@@ -17,7 +17,7 @@ import time
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Queue
@@ -35,6 +35,10 @@ from .host_environment import HostEnvironmentManager, HostEnvironmentProvider
 from .model_dependencies import resolve_notebook_model
 
 _RESPONSE_PREFIX = "__KEDI_NOTEBOOK_RESPONSE__"
+# The bridge hands the worker a dedicated pipe for protocol replies; see
+# _reserve_protocol_fds. The bridge sets this env var to the pipe's write
+# end; without it the worker falls back to descriptor 3.
+_PROTOCOL_FD = 3
 _WORKER = Path(__file__).with_name("sandbox_worker.py")
 _COMMON_PYTHON_DIRS = (
     Path("/opt/homebrew/bin"),
@@ -91,16 +95,28 @@ class HostPythonBridge:
         self._request_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._closed = False
-        self._process = subprocess.Popen(
-            [executable, "-u", str(_WORKER)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            cwd=cwd,
-            env=os.environ.copy(),
-        )
+        # Protocol replies travel on a dedicated pipe, never on the worker's
+        # stdout, so user code writing to fd 1 cannot forge a reply. The
+        # worker's stdout is /dev/null. pass_fds keeps the write end at its
+        # own number, so the worker learns it from the environment.
+        protocol_read, protocol_write = os.pipe()
+        protocol_env = os.environ.copy()
+        protocol_env["KEDI_NOTEBOOK_PROTOCOL_FD"] = str(protocol_write)
+        try:
+            self._process = subprocess.Popen(
+                [executable, "-u", str(_WORKER)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=cwd,
+                env=protocol_env,
+                pass_fds=(protocol_write,),
+            )
+        finally:
+            os.close(protocol_write)
+        self._protocol_in = os.fdopen(protocol_read, "r", encoding="utf-8", buffering=1)
         self._stderr: deque[str] = deque(maxlen=200)
         self._stderr_reader = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_reader.start()
@@ -111,9 +127,9 @@ class HostPythonBridge:
                 if self._closed:
                     raise BridgeCancelled("Host Python worker was interrupted")
                 process = self._process
-            if process.stdin is None or process.stdout is None:
+            if process.stdin is None:
                 raise RuntimeError("Host Python worker pipes are unavailable")
-            stdout = process.stdout
+            protocol_in = self._protocol_in
             if process.poll() is not None:
                 raise RuntimeError(self._worker_error("Host Python worker exited"))
             process.stdin.write(json.dumps(dict(payload), separators=(",", ":")) + "\n")
@@ -122,7 +138,7 @@ class HostPythonBridge:
 
             def read_response() -> None:
                 try:
-                    for line in stdout:
+                    for line in protocol_in:
                         if line.startswith(_RESPONSE_PREFIX):
                             response_queue.put(("response", line.removeprefix(_RESPONSE_PREFIX)))
                             return
@@ -160,6 +176,8 @@ class HostPythonBridge:
             self._closed = True
             process = self._process
         self._terminate_process(process)
+        with suppress(OSError, ValueError):
+            self._protocol_in.close()
 
     def _terminate_process(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:

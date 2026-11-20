@@ -280,3 +280,43 @@ def test_execute_cell_returns_nan_result_instead_of_failing(
         "type": "float",
         "value": "NaN",
     }
+
+
+def test_host_worker_ignores_forged_fd1_reply(tmp_path: Path) -> None:
+    import json
+    import sys
+
+    from kedi_notebook.runtime import HostPythonBridge
+
+    bridge = HostPythonBridge(sys.executable, cwd=tmp_path)
+    try:
+        forged = "__KEDI_NOTEBOOK_RESPONSE__" + json.dumps(
+            {
+                "ok": True,
+                "result": "FORGED-BY-USER-CODE",
+                "env": {},
+                "stdout": "",
+                "stderr": "",
+            }
+        )
+        code = (
+            "import os\n"
+            f"os.write(1, ({forged!r} + chr(10)).encode())\n"
+            "x = 'real-result'\n"
+        )
+        reply = bridge.request(
+            {"action": "execute_block", "code": code, "syncNames": ["x"]},
+            timeout=10,
+        )
+        # The genuine response, not the forgery written to fd 1.
+        assert reply.get("result") is None
+        assert reply.get("env", {}).get("x") == "real-result"
+        assert "FORGED-BY-USER-CODE" not in json.dumps(reply)
+        # The next request is not desynchronized either.
+        following = bridge.request(
+            {"action": "evaluate_inline", "code": "1+1", "syncNames": []},
+            timeout=10,
+        )
+        assert following.get("result") == 2
+    finally:
+        bridge.close()
