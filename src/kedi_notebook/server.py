@@ -479,12 +479,15 @@ def create_app(
         from kedi.lsp.features import compute_hover
         from lsprotocol import types as lsp
 
-        python_hover = await asyncio.to_thread(
-            pyright.hover,
-            payload.source,
-            payload.line,
-            payload.character,
-        )
+        try:
+            python_hover = await asyncio.to_thread(
+                pyright.hover,
+                payload.source,
+                payload.line,
+                payload.character,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_hover = None
         if python_hover is not None:
             return {"ok": True, "hover": python_hover, "provider": "pyright"}
         result = compute_hover(
@@ -546,12 +549,15 @@ def create_app(
         from kedi.lsp.features import compute_completion
         from lsprotocol import types as lsp
 
-        python_items = await asyncio.to_thread(
-            pyright.completion,
-            payload.source,
-            payload.line,
-            payload.character,
-        )
+        try:
+            python_items = await asyncio.to_thread(
+                pyright.completion,
+                payload.source,
+                payload.line,
+                payload.character,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_items = None
         if python_items is not None:
             return {"ok": True, "items": python_items, "provider": "pyright"}
         items = await asyncio.to_thread(
@@ -623,13 +629,16 @@ def create_app(
         from kedi.lsp.features import compute_references
         from lsprotocol import types as lsp
 
-        python_locations = await asyncio.to_thread(
-            pyright.references,
-            payload.source,
-            payload.line,
-            payload.character,
-            include_declaration=payload.include_declaration,
-        )
+        try:
+            python_locations = await asyncio.to_thread(
+                pyright.references,
+                payload.source,
+                payload.line,
+                payload.character,
+                include_declaration=payload.include_declaration,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_locations = None
         if python_locations is not None:
             return {"ok": True, "references": python_locations, "provider": "pyright"}
         locations = await asyncio.to_thread(
@@ -651,12 +660,15 @@ def create_app(
         from kedi.lsp.features import compute_prepare_rename
         from lsprotocol import types as lsp
 
-        python_result = await asyncio.to_thread(
-            pyright.prepare_rename,
-            payload.source,
-            payload.line,
-            payload.character,
-        )
+        try:
+            python_result = await asyncio.to_thread(
+                pyright.prepare_rename,
+                payload.source,
+                payload.line,
+                payload.character,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_result = None
         if python_result is not None:
             return {"ok": True, "rename": python_result, "provider": "pyright"}
         range_ = await asyncio.to_thread(
@@ -676,13 +688,16 @@ def create_app(
         from kedi.lsp.features import compute_rename
         from lsprotocol import types as lsp
 
-        python_edits = await asyncio.to_thread(
-            pyright.rename,
-            payload.source,
-            payload.line,
-            payload.character,
-            payload.new_name,
-        )
+        try:
+            python_edits = await asyncio.to_thread(
+                pyright.rename,
+                payload.source,
+                payload.line,
+                payload.character,
+                payload.new_name,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_edits = None
         if python_edits is not None:
             return {"ok": True, "edits": python_edits, "provider": "pyright"}
         workspace_edit = await asyncio.to_thread(

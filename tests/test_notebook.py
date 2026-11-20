@@ -1943,3 +1943,40 @@ def test_pyodide_worker_object_registry_is_bounded(
     finally:
         registry.clear()
         registry.update(saved)
+
+
+# Audit #215 item 11: a failing Pyright must fall back to Kedi, not 500.
+def test_notebook_lsp_endpoints_fall_back_to_kedi_when_pyright_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kedi_notebook.pyright import PyrightServer
+
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("Pyright language server stopped")
+
+    for method in ("hover", "completion", "references", "prepare_rename", "rename"):
+        monkeypatch.setattr(PyrightServer, method, failing)
+    app = create_app(cwd=tmp_path)
+    source = "[value: int] = `1`\n[value] := `value + 1`\n> show: <value>"
+    position = {"source": source, "line": 2, "character": 10}
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        hover = client.post("/api/lsp/hover", json=position)
+        completion = client.post("/api/lsp/completion", json=position)
+        references = client.post(
+            "/api/lsp/references", json={**position, "includeDeclaration": True}
+        )
+        prepared = client.post("/api/lsp/prepare-rename", json=position)
+        renamed = client.post("/api/lsp/rename", json={**position, "newName": "count"})
+
+    assert hover.status_code == 200
+    assert hover.json()["provider"] == "kedi"
+    assert completion.status_code == 200
+    assert completion.json()["provider"] == "kedi"
+    assert references.status_code == 200
+    assert references.json()["provider"] == "kedi"
+    assert prepared.status_code == 200
+    assert prepared.json()["provider"] == "kedi"
+    assert renamed.status_code == 200
+    assert renamed.json()["provider"] == "kedi"
