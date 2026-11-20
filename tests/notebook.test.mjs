@@ -63,3 +63,24 @@ test("postOutput posts chunks instead of one oversized body", () => {
   assert.match(postOutput, /text: chunk/);
   assert.doesNotMatch(postOutput, /JSON\.stringify\(\{ requestId, stream, text \}\)/);
 });
+
+test("teardown runs on pagehide, not beforeunload", () => {
+  // The dirty prompt stays on beforeunload; the destructive teardown
+  // (persistDraft + session DELETE + bridge/runtime disposal) must only
+  // run when the page is actually going away.
+  const beforeunloadCount = (notebookSource.match(/addEventListener\("beforeunload"/g) || []).length;
+  assert.equal(beforeunloadCount, 1);
+  const pagehideStart = notebookSource.indexOf('addEventListener("pagehide"');
+  assert.notEqual(pagehideStart, -1, "no pagehide listener");
+  const pagehideEnd = notebookSource.indexOf("\n  });", pagehideStart);
+  const pagehide = notebookSource.slice(pagehideStart, pagehideEnd + 5);
+  assert.match(pagehide, /persistDraft\(\)/);
+  assert.match(pagehide, /method: "DELETE"/);
+  assert.match(pagehide, /browserBridge\?\.stop\(\)/);
+  assert.match(pagehide, /browserRuntime\?\.dispose\(\)/);
+  const beforeunloadStart = notebookSource.indexOf('addEventListener("beforeunload"');
+  const beforeunloadEnd = notebookSource.indexOf("\n  });", beforeunloadStart);
+  const beforeunload = notebookSource.slice(beforeunloadStart, beforeunloadEnd + 5);
+  assert.match(beforeunload, /state\.dirty/);
+  assert.doesNotMatch(beforeunload, /DELETE/);
+});

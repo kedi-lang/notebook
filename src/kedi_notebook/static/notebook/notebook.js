@@ -165,7 +165,10 @@ function bindEvents() {
   ui.saveJustNotebook.addEventListener("click", () => void saveNotebook("notebook"));
   ui.openNotebook.addEventListener("click", () => ui.notebookFile.click());
   ui.notebookFile.addEventListener("change", () => void openNotebookFile());
-  window.addEventListener("beforeunload", () => {
+  // Teardown only runs once the page is actually going away. beforeunload
+  // fires before the leave/stay prompt resolves, so it deleted the session
+  // even when the user clicked "Stay".
+  window.addEventListener("pagehide", () => {
     persistDraft();
     if (state.sessionId) {
       void apiFetch(`/api/notebook/sessions/${state.sessionId}`, {
