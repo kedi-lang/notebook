@@ -115,3 +115,36 @@ def test_secret_store_refuses_to_load_process_control_names_from_disk(
     )
     with pytest.raises(RuntimeError, match="invalid entries"):
         NotebookSecretStore(path)
+
+
+def test_dotenv_import_rejects_paths_outside_cwd(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "leaked.env").write_text("LEAKED_MARKER=traversed\n", encoding="utf-8")
+    (project / ".env").write_text("LOCAL_MARKER=inside\n", encoding="utf-8")
+    secret_store = NotebookSecretStore(tmp_path / "secrets.json")
+    app = create_app(cwd=project, secret_store=secret_store)
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        dotdot = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "../outside/leaked.env"},
+        )
+        absolute = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "/etc/passwd"},
+        )
+        local = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "./.env"},
+        )
+
+    assert dotdot.status_code == 400
+    assert "inside the notebook directory" in dotdot.json()["error"]
+    assert absolute.status_code == 400
+    assert "inside the notebook directory" in absolute.json()["error"]
+    assert local.status_code == 200
+    assert local.json()["imported"] == ["LOCAL_MARKER"]
+    assert "LEAKED_MARKER" not in secret_store.names

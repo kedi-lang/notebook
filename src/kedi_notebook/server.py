@@ -781,6 +781,8 @@ def _resolve_dotenv_path(raw_path: str, *, cwd: Path) -> Path:
         raise ValueError("The selected .env file does not exist") from exc
     if not resolved.is_file():
         raise ValueError("The selected .env path is not a file")
+    if not resolved.is_relative_to(cwd):
+        raise ValueError("The selected .env file must be inside the notebook directory")
     if resolved.stat().st_size > _MAX_DOTENV_BYTES:
         raise ValueError("The selected .env file is larger than 1 MB")
     return resolved
