@@ -341,7 +341,11 @@ def _live_thread_idents() -> set[int]:
 def _open_fd_count() -> int:
     import os
 
-    return len(os.listdir("/proc/self/fd"))
+    # /proc/self/fd is Linux-only; macOS exposes the same entries via /dev/fd.
+    for fd_dir in ("/proc/self/fd", "/dev/fd"):
+        if os.path.isdir(fd_dir):
+            return len(os.listdir(fd_dir))
+    raise RuntimeError("no file-descriptor directory found")
 
 
 def test_stream_host_process_releases_threads_and_fds(tmp_path: Path) -> None:
