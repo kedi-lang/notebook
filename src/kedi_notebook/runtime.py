@@ -4,6 +4,7 @@ import base64
 import binascii
 import codecs
 import json
+import math
 import os
 import re
 import shlex
@@ -20,7 +21,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Literal
+from typing import Any, Final, Literal
 from uuid import uuid4
 
 import kedi
@@ -842,10 +843,24 @@ def _json_result(value: object) -> dict[str, object] | None:
     if media is not None:
         return media
     try:
-        serialized = json.dumps(value)
+        serialized = json.dumps(value, allow_nan=False)
     except (TypeError, ValueError):
-        rendered = _truncate_output(repr(value))
-        return {"kind": "repr", "type": type(value).__name__, "value": rendered}
+        # Non-finite floats (NaN, Infinity) are not JSON, so Starlette's
+        # JSONResponse rejected the whole cell with a 400. Show them as the
+        # text the user would read instead of failing the cell.
+        sanitized = _sanitize_json_value(value)
+        if sanitized is _UNSANITIZABLE:
+            rendered = _truncate_output(repr(value))
+            return {"kind": "repr", "type": type(value).__name__, "value": rendered}
+        serialized = json.dumps(sanitized, allow_nan=False)
+        if len(serialized) > _OUTPUT_LIMIT:
+            return {
+                "kind": "repr",
+                "type": type(value).__name__,
+                "value": _truncate_output(serialized),
+                "truncated": True,
+            }
+        return {"kind": "json", "type": type(value).__name__, "value": sanitized}
     if len(serialized) > _OUTPUT_LIMIT:
         return {
             "kind": "repr",
@@ -854,6 +869,51 @@ def _json_result(value: object) -> dict[str, object] | None:
             "truncated": True,
         }
     return {"kind": "json", "type": type(value).__name__, "value": value}
+
+
+_UNSANITIZABLE: Final = object()
+
+
+def _sanitize_json_value(value: object, *, _seen: frozenset[int] = frozenset()) -> object:
+    """Replace non-finite floats with their names for JSON output.
+
+    Returns ``_UNSANITIZABLE`` for values that are not plain JSON data (custom
+    objects, sets, cyclic structures); those keep the ``repr`` fallback.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, Mapping):
+        if id(value) in _seen:
+            return _UNSANITIZABLE
+        seen = _seen | {id(value)}
+        sanitized: dict[object, object] = {}
+        for key, item in value.items():
+            clean_key = _sanitize_json_value(key, _seen=seen) if isinstance(key, float) else key
+            if clean_key is _UNSANITIZABLE:
+                return _UNSANITIZABLE
+            clean_item = _sanitize_json_value(item, _seen=seen)
+            if clean_item is _UNSANITIZABLE:
+                return _UNSANITIZABLE
+            sanitized[key] = clean_item
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        if id(value) in _seen:
+            return _UNSANITIZABLE
+        seen = _seen | {id(value)}
+        items: list[object] = []
+        for item in value:
+            clean_item = _sanitize_json_value(item, _seen=seen)
+            if clean_item is _UNSANITIZABLE:
+                return _UNSANITIZABLE
+            items.append(clean_item)
+        return items
+    return _UNSANITIZABLE
 
 
 def _media_displays(displays: list[dict[str, object]]) -> AbstractContextManager[None]:

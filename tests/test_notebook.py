@@ -1623,3 +1623,88 @@ def test_notebook_api_rejects_chunked_body_over_limit(tmp_path: Path) -> None:
     finally:
         server.should_exit = True
         serving.join(timeout=10)
+
+
+# Audit #215 item 6: non-finite floats are shown as text, not a failed cell.
+def test_json_result_shows_nan_and_infinity_as_text() -> None:
+    assert notebook_runtime._json_result(float("nan")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "NaN",
+    }
+    assert notebook_runtime._json_result(float("inf")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "Infinity",
+    }
+    assert notebook_runtime._json_result(float("-inf")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "-Infinity",
+    }
+    nested = notebook_runtime._json_result(
+        {"a": float("nan"), "b": [1, float("inf"), {"c": float("-inf")}]}
+    )
+    assert nested == {
+        "kind": "json",
+        "type": "dict",
+        "value": {"a": "NaN", "b": [1, "Infinity", {"c": "-Infinity"}]},
+    }
+    for value in (
+        float("nan"),
+        float("inf"),
+        {"a": float("nan")},
+        [float("-inf")],
+    ):
+        result = notebook_runtime._json_result(value)
+        assert result is not None
+        # The payload must survive Starlette's strict JSON encoding.
+        json.dumps(result, allow_nan=False)
+
+
+def test_json_result_keeps_repr_fallback_for_cyclic_values() -> None:
+    cyclic: dict[str, object] = {"value": float("nan")}
+    cyclic["self"] = cyclic
+
+    result = notebook_runtime._json_result(cyclic)
+
+    assert result is not None and result["kind"] == "repr"
+    assert "nan" in str(result["value"])
+    json.dumps(result, allow_nan=False)
+
+
+def test_notebook_api_returns_nan_cell_result_instead_of_failing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(cwd=tmp_path)
+    session = app.state.notebook_manager.create(mode="browser")
+    original_execute = session._session.execute
+
+    def execute(source: str, *, source_name: str | None = None) -> object:
+        # Interactive cells cannot return a top-level value (root returns are
+        # rejected), so the session result is stubbed here: the layer under
+        # test is result serialization, not Kedi semantics.
+        if "nan" in source:
+            return float("nan")
+        if "inf" in source:
+            return float("inf")
+        return original_execute(source, source_name=source_name)
+
+    monkeypatch.setattr(session._session, "execute", execute)
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        nan = client.post(
+            f"/api/notebook/sessions/{session.id}/cells/execute",
+            json={"cellId": "nan", "source": "> show: `float('nan')`"},
+        )
+        inf = client.post(
+            f"/api/notebook/sessions/{session.id}/cells/execute",
+            json={"cellId": "inf", "source": "> show: `float('inf')`"},
+        )
+
+    assert nan.status_code == 200
+    assert nan.json()["ok"] is True
+    assert nan.json()["result"] == {"kind": "json", "type": "float", "value": "NaN"}
+    assert inf.status_code == 200
+    assert inf.json()["result"] == {"kind": "json", "type": "float", "value": "Infinity"}
