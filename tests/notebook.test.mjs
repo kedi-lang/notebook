@@ -144,3 +144,70 @@ test("editor disposes the per-model highlighter on model disposal", async () => 
   assert.match(provider, /highlighter\.dispose\(\)/);
   assert.match(provider, /highlighters\.delete\(model\)/);
 });
+
+const workerSource = await readFile(
+  new URL("../src/kedi_notebook/static/pyodide-worker.js", import.meta.url),
+  "utf8",
+);
+
+let requestImportsPackage = null;
+function loadRequestImportsPackage() {
+  if (requestImportsPackage === null) {
+    requestImportsPackage = new Function(
+      `${extractFunction(workerSource, "requestImportsPackage")}\nreturn requestImportsPackage;`,
+    )();
+  }
+  return requestImportsPackage;
+}
+
+test("optional-package detection only fires on real imports", () => {
+  const requestImportsPackage = loadRequestImportsPackage();
+  // Benign mentions from the verification repro: a comment and a string
+  // literal must not trigger an install or an error.
+  assert.equal(
+    requestImportsPackage(
+      { action: "execute_block", code: "# TODO: compare with logfire later\nx = 1" },
+      "logfire",
+    ),
+    false,
+  );
+  assert.equal(
+    requestImportsPackage(
+      {
+        action: "execute_block",
+        code: 'note = "pydantic_monty is not installed here"\nx = 2',
+      },
+      "pydantic_monty",
+    ),
+    false,
+  );
+  assert.equal(requestImportsPackage({ action: "execute_block", code: "x = 1" }, "logfire"), false);
+  assert.equal(requestImportsPackage({}, "logfire"), false);
+  assert.equal(requestImportsPackage({ code: "import logfirex" }, "logfire"), false);
+  assert.equal(requestImportsPackage({ code: "x = 'import logfire'" }, "logfire"), false);
+
+  assert.equal(requestImportsPackage({ code: "import logfire\nx = 1" }, "logfire"), true);
+  assert.equal(
+    requestImportsPackage({ code: "from logfire import configure" }, "logfire"),
+    true,
+  );
+  assert.equal(
+    requestImportsPackage({ code: "import pydantic_monty" }, "pydantic_monty"),
+    true,
+  );
+  assert.equal(
+    requestImportsPackage({ code: "import logfire as lf" }, "logfire"),
+    true,
+  );
+});
+
+test("ensureOptionalPackages no longer substring-matches the request", () => {
+  const start = workerSource.indexOf("async function ensureOptionalPackages");
+  assert.notEqual(start, -1, "ensureOptionalPackages not found");
+  const end = workerSource.indexOf("\n}\n", start);
+  const fn = workerSource.slice(start, end + 3);
+  assert.doesNotMatch(fn, /JSON\.stringify\(request\)/);
+  assert.doesNotMatch(fn, /\.includes\(/);
+  assert.match(fn, /requestImportsPackage\(request, "pydantic_monty"\)/);
+  assert.match(fn, /requestImportsPackage\(request, "logfire"\)/);
+});

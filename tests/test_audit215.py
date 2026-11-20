@@ -871,6 +871,53 @@ def test_bridge_output_chunks_accumulate(tmp_path: Path) -> None:
     assert "".join(event["text"] for event in outputs) == text
 
 
+def test_terminal_driver_install_response_matches_streamed_output() -> None:
+    """The install branch streams "Installing.../Installed..." and must
+    return the full streamed stdout, or the server's prefix dedup fails
+    and "Installed ..." is printed a second time."""
+    import asyncio
+    import json
+    import re
+    import sys
+    import textwrap
+    import types
+
+    static_root = Path(__file__).parent.parent / "src" / "kedi_notebook" / "static"
+    source = (static_root / "pyodide-worker.js").read_text(encoding="utf-8")
+    match = re.search(r"const TERMINAL_DRIVER = String\.raw`(.*?)`;\n", source, re.S)
+    assert match is not None, "TERMINAL_DRIVER not found in pyodide-worker.js"
+    template = match.group(1).rstrip()
+    lines = template.splitlines()
+    assert lines[-1].strip() == "json.dumps(__kedi_terminal_response)"
+    body = "\n".join(lines[:-1])
+    streamed: list[tuple[str, str]] = []
+
+    micropip = types.ModuleType("micropip")
+
+    async def install(packages):
+        return None
+
+    micropip.install = install
+    sys.modules["micropip"] = micropip
+    namespace: dict = {
+        "kediStreamOutput": lambda stream, text: streamed.append((stream, text)),
+        "__kedi_terminal_command_json": json.dumps("pip install requests"),
+    }
+    wrapped = (
+        "async def __run_terminal():\n"
+        + textwrap.indent(body, "    ")
+        + "\n    return __kedi_terminal_response\n"
+    )
+    exec(compile(wrapped, "<terminal-driver>", "exec"), namespace)
+    response = asyncio.run(namespace["__run_terminal"]())
+
+    assert response["ok"] is True
+    streamed_text = "".join(text for stream, text in streamed if stream == "stdout")
+    assert streamed_text == "Installing requests...\nInstalled requests in the browser runtime.\n"
+    assert response["stdout"] == streamed_text
+    assert response["stdout"].count("Installed") == 1
+
+
 def test_bridge_output_endpoint_still_rejects_over_64k(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 

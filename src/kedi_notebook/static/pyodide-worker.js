@@ -67,10 +67,10 @@ try:
         json.loads(__kedi_terminal_command_json)
     )
     if __kedi_terminal["kind"] == "install":
-        kediStreamOutput(
-            "stdout",
-            "Installing " + ", ".join(__kedi_terminal["packages"]) + "...\n",
+        __kedi_installing = (
+            "Installing " + ", ".join(__kedi_terminal["packages"]) + "...\n"
         )
+        kediStreamOutput("stdout", __kedi_installing)
         await micropip.install(__kedi_terminal["packages"])
         __kedi_note = (
             " Project files are unchanged."
@@ -87,7 +87,10 @@ try:
         kediStreamOutput("stdout", __kedi_output)
         __kedi_terminal_response = {
             "ok": True,
-            "stdout": __kedi_output,
+            # The full streamed stdout: the server dedups the response
+            # against the streamed text by prefix, so returning only the
+            # "Installed" line would print it a second time.
+            "stdout": __kedi_installing + __kedi_output,
             "stderr": "",
         }
     elif __kedi_terminal["kind"] == "list":
@@ -140,14 +143,24 @@ async function initializePyodide() {
   return pyodide;
 }
 
+// Optional packages are installed only when the Kedi source actually
+// imports them. A substring match over the whole request JSON
+// false-positives on comments and string literals mentioning the name.
+function requestImportsPackage(request, packageName) {
+  const code = typeof request?.code === "string" ? request.code : "";
+  return new RegExp(
+    `(?:^|;)\\s*(?:import\\s+${packageName}\\b|from\\s+${packageName}\\s+import\\b)`,
+    "m",
+  ).test(code);
+}
+
 async function ensureOptionalPackages(pyodide, request) {
-  const serialized = JSON.stringify(request);
-  if (serialized.includes("pydantic_monty")) {
+  if (requestImportsPackage(request, "pydantic_monty")) {
     throw new Error(
       "pydantic_monty is not supported by the Pyodide runtime; use server sandbox execution",
     );
   }
-  if (serialized.includes("logfire")) {
+  if (requestImportsPackage(request, "logfire")) {
     await installLogfire(pyodide);
   }
 }
