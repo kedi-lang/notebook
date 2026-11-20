@@ -10,6 +10,7 @@ import stat
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1582,3 +1583,43 @@ def test_notebook_secret_api_import_dotenv_rejects_paths_outside_cwd(
         assert inside.status_code == 200
         assert inside.json()["imported"] == ["LEAKED_VALUE"]
         assert os.environ["LEAKED_VALUE"] == "from-dotenv"
+
+
+# Audit #215 item 3: a chunked body must hit the same size limit as one with
+# Content-Length.
+def test_notebook_api_rejects_chunked_body_over_limit(tmp_path: Path) -> None:
+    app = create_app(cwd=tmp_path)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    base_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    server = _notebook_server(app, uvicorn.Config(app, log_level="warning"))
+    serving = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+    serving.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started
+
+        def oversized_chunks() -> Iterator[bytes]:
+            for _ in range(100):
+                yield b"x" * 100_000  # 10 MB total, no Content-Length.
+
+        # trust_env=False: the sandbox sets proxy variables httpx cannot parse.
+        with httpx.Client(trust_env=False, timeout=30) as http:
+            oversized = http.post(
+                f"{base_url}/api/lsp/diagnostics",
+                content=oversized_chunks(),
+                headers={"Content-Type": "application/json"},
+            )
+            assert oversized.status_code == 413
+
+            small = http.post(
+                f"{base_url}/api/lsp/diagnostics",
+                content=iter([b'{"source": ""}']),
+                headers={"Content-Type": "application/json"},
+            )
+            assert small.status_code == 200
+    finally:
+        server.should_exit = True
+        serving.join(timeout=10)

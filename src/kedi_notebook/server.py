@@ -195,6 +195,21 @@ def create_app(
                     {"ok": False, "error": "Request body is too large"},
                     status_code=413,
                 )
+            elif (
+                await _read_body_within_limit(
+                    request,
+                    limit=(
+                        _MAX_RESTORE_REQUEST_BYTES
+                        if request.url.path == "/api/notebook/sessions/restore"
+                        else _MAX_REQUEST_BYTES
+                    ),
+                )
+                is None
+            ):
+                response = JSONResponse(
+                    {"ok": False, "error": "Request body is too large"},
+                    status_code=413,
+                )
             else:
                 response = await call_next(request)
         else:
@@ -831,6 +846,29 @@ def _request_too_large(request: Request, *, limit: int) -> bool:
         return int(content_length) > limit
     except ValueError:
         return True
+
+
+async def _read_body_within_limit(request: Request, *, limit: int) -> bytes | None:
+    """Read the request body, enforcing ``limit`` even without Content-Length.
+
+    A chunked (or otherwise length-less) body used to bypass the size check
+    entirely. Returns the body, or ``None`` once more than ``limit`` bytes
+    arrive. Bodies already bounded by a Content-Length header are left for
+    the endpoint to read; the read body is cached on the request so the
+    endpoint reuses it instead of reading the stream twice.
+    """
+    if request.headers.get("content-length") is not None:
+        return b""
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    request._body = body  # noqa: SLF001 - Starlette's Request.body() cache.
+    return body
 
 
 def _range_payload(range_: Any) -> dict[str, dict[str, int]]:
