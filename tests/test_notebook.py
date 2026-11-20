@@ -1534,3 +1534,51 @@ def test_notebook_secret_store_drops_process_control_names_on_disk_load(
     assert store.names == ("OPENAI_API_KEY",)
     assert "PYTHONPATH" not in os.environ
     assert os.environ["OPENAI_API_KEY"] == "not-a-real-key"
+
+
+# Audit #215 item 2: dotenv imports must stay inside the notebook directory.
+def test_notebook_secret_api_import_dotenv_rejects_paths_outside_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LEAKED_VALUE", raising=False)
+    monkeypatch.delenv("OUTSIDE_VALUE", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "leaked.env").write_text("OUTSIDE_VALUE=from-outside\n", encoding="utf-8")
+    (project / ".env").write_text("LEAKED_VALUE=from-dotenv\n", encoding="utf-8")
+    app = create_app(
+        cwd=project,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        traversal = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "../outside/leaked.env"},
+        )
+        assert traversal.status_code == 400
+        assert "inside the notebook directory" in traversal.json()["error"]
+        # The file outside the cwd was never read.
+        assert "OUTSIDE_VALUE" not in os.environ
+
+        absolute = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "/etc/passwd"},
+        )
+        assert absolute.status_code == 400
+        home = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "~/.env"},
+        )
+        assert home.status_code == 400
+
+        inside = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "./.env"},
+        )
+        assert inside.status_code == 200
+        assert inside.json()["imported"] == ["LEAKED_VALUE"]
+        assert os.environ["LEAKED_VALUE"] == "from-dotenv"
