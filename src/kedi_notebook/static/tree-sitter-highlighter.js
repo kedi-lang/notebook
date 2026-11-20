@@ -182,7 +182,7 @@ class KediTreeSitterHighlighter {
 
 async function loadResources() {
   if (!resourcesPromise) {
-    resourcesPromise = (async () => {
+    const promise = (async () => {
       const [
         { Parser, Language, Query },
         kediHighlights,
@@ -214,6 +214,14 @@ async function loadResources() {
         injectionQuery: new Query(kediLanguage, kediInjections),
       };
     })();
+    resourcesPromise = promise;
+    // A rejected load must not stay cached: clear it so the next call
+    // retries instead of returning the same rejection forever.
+    promise.catch(() => {
+      if (resourcesPromise === promise) {
+        resourcesPromise = undefined;
+      }
+    });
   }
   return resourcesPromise;
 }
