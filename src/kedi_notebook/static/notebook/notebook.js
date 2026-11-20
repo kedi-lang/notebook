@@ -3,6 +3,7 @@ import {
   createKediEditor,
   setKediExecutionDiagnostic,
 } from "/kedi-editor.js";
+import { splitOutputText } from "./output-chunks.js";
 
 const STORAGE_KEY = "kedi.notebook.draft.v1";
 const MAX_NOTEBOOK_BYTES = 5_000_000;
@@ -760,16 +761,21 @@ class BrowserSessionBridge {
         let outputPosts = Promise.resolve();
         const postOutput = (stream, text) => {
           const requestId = currentId;
-          outputPosts = outputPosts.then(() =>
-            fetchJson(
-              `/api/notebook/sessions/${this.sessionId}/bridge/output`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ requestId, stream, text }),
-              },
-            ),
-          );
+          // One bridge/output post accepts at most 64,000 characters, so
+          // split longer output into ordered chunks (the promise chain
+          // below keeps them in order).
+          for (const chunk of splitOutputText(text)) {
+            outputPosts = outputPosts.then(() =>
+              fetchJson(
+                `/api/notebook/sessions/${this.sessionId}/bridge/output`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ requestId, stream, text: chunk }),
+                },
+              ),
+            );
+          }
         };
         const postResponse = async (response) => {
           await outputPosts;

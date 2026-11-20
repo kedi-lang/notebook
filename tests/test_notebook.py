@@ -2244,3 +2244,66 @@ def test_notebook_pagehide_deletes_session_and_beforeunload_only_warns() -> None
     assert "DELETE" not in beforeunload
     assert "browserBridge" not in beforeunload
     assert "browserRuntime" not in beforeunload
+
+
+# Audit #215 item 4: a 200 KB print must reach the session as ordered
+# 64,000-char chunks instead of dropping the whole POST with a 422.
+def test_browser_terminal_accepts_chunked_output_in_order(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(cwd=tmp_path)
+    session = manager.create(mode="browser")
+    release_response = threading.Event()
+    chunks = ["a" * 64_000, "b" * 64_000, "c" * 64_000, "d" * 8_000]
+
+    def serve_terminal() -> None:
+        request = session.next_browser_request(timeout=1)
+        assert request is not None
+        request_id = request.pop("id")
+        assert request == {"action": "execute_terminal", "command": "pip list"}
+        for chunk in chunks:
+            session.submit_browser_output(request_id, stream="stdout", text=chunk)
+        assert release_response.wait(timeout=2)
+        session.submit_browser_response(
+            request_id,
+            {"ok": True, "stdout": "".join(chunks), "stderr": ""},
+        )
+
+    worker = threading.Thread(target=serve_terminal)
+    worker.start()
+    try:
+        events = session.stream_terminal(cell_id="packages", source="!pip list")
+        first = next(events)
+        assert first == {"type": "output", "stream": "stdout", "text": chunks[0]}
+        release_response.set()
+        remaining = list(events)
+        outputs = [
+            event
+            for event in [first, *remaining]
+            if event.get("type") == "output" and event.get("stream") == "stdout"
+        ]
+        assert "".join(event["text"] for event in outputs) == "".join(chunks)
+        assert remaining[-1]["ok"] is True
+        # The session survives the large output.
+        assert manager.get(session.id) is session
+    finally:
+        release_response.set()
+        manager.close_all()
+        worker.join(timeout=2)
+
+
+def test_browser_output_post_rejects_single_oversized_text(tmp_path: Path) -> None:
+    app = create_app(cwd=tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        session = client.post("/api/notebook/sessions", json={"mode": "browser"}).json()
+        session_id = session["sessionId"]
+        oversized = client.post(
+            f"/api/notebook/sessions/{session_id}/bridge/output",
+            json={"requestId": "req-1", "stream": "stdout", "text": "x" * 64_001},
+        )
+        assert oversized.status_code == 422
+        # At the limit the payload itself is valid: the handler then rejects
+        # the unknown request id (400), which is not a validation failure.
+        at_limit = client.post(
+            f"/api/notebook/sessions/{session_id}/bridge/output",
+            json={"requestId": "req-1", "stream": "stdout", "text": "x" * 64_000},
+        )
+        assert at_limit.status_code == 400
