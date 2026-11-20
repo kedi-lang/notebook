@@ -314,6 +314,11 @@ async function registerKediLanguage(monaco) {
       if (!highlighterPromise) {
         highlighterPromise = createKediTreeSitterHighlighter();
         highlighters.set(model, highlighterPromise);
+        // The highlighter owns two WASM parsers and a tree per model; free
+        // them when the model goes away instead of leaking them per model.
+        model.onWillDispose(() => {
+          void highlighterPromise.then((created) => created.dispose());
+        });
       }
       const highlighter = await highlighterPromise;
       if (
