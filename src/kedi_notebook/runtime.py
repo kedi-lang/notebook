@@ -433,12 +433,20 @@ class NotebookSession:
         if not tokens:
             raise ValueError("Terminal command cannot be empty")
         executable = self.python.executable
-        if tokens[0] in {"pip", "pip3"}:
+        # A pip/python command with shell syntax (a pipe, redirect or
+        # separator) must go through the shell: the direct argv silently
+        # dropped the extra tokens, so `!pip list | grep foo` ignored the
+        # pipe entirely. A token ending in ";" is a separator attached to
+        # the previous word (`pip list; echo done`); a ";" inside a quoted
+        # -c string stays inside its token, so it is not misread.
+        if any(token in _SHELL_OPERATORS or token.endswith(";") for token in tokens):
+            argv = _shell_argv(command)
+        elif tokens[0] in {"pip", "pip3"}:
             argv = [executable, "-m", "pip", *tokens[1:]]
         elif tokens[0] in {"python", "python3"}:
             argv = [executable, *tokens[1:]]
         else:
-            argv = ["/bin/sh", "-lc", command]
+            argv = _shell_argv(command)
 
         yield from self._stream_host_process(argv, command=command)
 
@@ -712,15 +720,20 @@ class NotebookSessionManager:
                 environment=prepared.directory,
             )
         session_id = uuid4().hex
-        session = NotebookSession(
-            session_id=session_id,
-            mode=mode,
-            cwd=self.cwd,
-            python=python,
-            interactive_options=self._interactive_options,
-            session_snapshot=session_snapshot,
-        )
+        # Hold the lock while constructing and registering the session: the
+        # constructor starts the bridge (and may be slow in kedi.interactive),
+        # and a close_all() that ran between construction and registration
+        # would miss the session and leak it. close_all() blocks on the same
+        # lock, then closes the registered session.
         with self._lock:
+            session = NotebookSession(
+                session_id=session_id,
+                mode=mode,
+                cwd=self.cwd,
+                python=python,
+                interactive_options=self._interactive_options,
+                session_snapshot=session_snapshot,
+            )
             self._sessions[session_id] = session
         return session
 
@@ -1087,6 +1100,17 @@ def _requires_runtime_reset(exc: BaseException) -> bool:
             else current.__cause__ or current.__context__
         )
     return False
+
+
+def _shell_argv(command: str) -> list[str]:
+    # /bin/sh does not exist on Windows; cmd.exe supports the same pipes and
+    # redirects the shell branch relies on.
+    if os.name == "nt":
+        return ["cmd.exe", "/c", command]
+    return ["/bin/sh", "-lc", command]
+
+
+_SHELL_OPERATORS: Final = frozenset({"|", "||", "&", "&&", ">", ">>", "<", "<<", ";"})
 
 
 def _terminal_commands(source: str) -> list[str]:

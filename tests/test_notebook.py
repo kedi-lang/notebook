@@ -2307,3 +2307,64 @@ def test_browser_output_post_rejects_single_oversized_text(tmp_path: Path) -> No
             json={"requestId": "req-1", "stream": "stdout", "text": "x" * 64_000},
         )
         assert at_limit.status_code == 400
+
+
+# Audit #215 item 16: a close_all() that runs while a session is still being
+# constructed must close the new session instead of missing it.
+def test_notebook_session_create_close_all_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kedi
+
+    manager = NotebookSessionManager(cwd=tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    real_interactive = kedi.interactive
+
+    def slow_interactive(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        assert release.wait(timeout=10)
+        return real_interactive(*args, **kwargs)
+
+    monkeypatch.setattr(kedi, "interactive", slow_interactive)
+    created: list[Any] = []
+    worker = threading.Thread(target=lambda: created.append(manager.create(mode="browser")))
+    worker.start()
+    assert started.wait(timeout=10)
+    closer = threading.Thread(target=manager.close_all)
+    closer.start()
+    time.sleep(0.5)
+    release.set()
+    worker.join(timeout=10)
+    closer.join(timeout=10)
+    assert len(created) == 1
+    session = created[0]
+    assert session._closed
+    with pytest.raises(KeyError):
+        manager.get(session.id)
+
+
+# Audit #215 item 16: a pip/python command with shell syntax must run through
+# the shell instead of silently dropping the pipe.
+def test_notebook_host_terminal_pipes_through_shell(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        events = list(
+            session.stream_terminal(
+                cell_id="terminal",
+                source=("!python -c \"print('hello'); print('goodbye')\" | grep goodbye"),
+            )
+        )
+    finally:
+        manager.close_all()
+
+    outputs = [event for event in events if event.get("type") == "output"]
+    assert "".join(event["text"] for event in outputs) == "goodbye\n"
+    result = [event for event in events if event.get("type") == "result"][0]
+    assert result["ok"] is True
