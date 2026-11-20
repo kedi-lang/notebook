@@ -9,7 +9,21 @@ const MAX_NOTEBOOK_BYTES = 5_000_000;
 const MAX_CELLS = 1_000;
 const MAX_SOURCE_CHARS = 1_000_000;
 const MAX_OUTPUT_CHARS = 200_000;
+const MAX_BRIDGE_OUTPUT_CHARS = 64_000;
 const OUTPUT_TRUNCATION_NOTICE = "\n[output truncated by Kedi Notebook]";
+
+// Split browser output into posts the server accepts: bridge/output
+// rejects a single text over MAX_BRIDGE_OUTPUT_CHARS (64_000). Chunks are
+// posted in order and accumulate in BridgeRun, so a 200 KB print() no
+// longer kills the session with a 422.
+function chunkBridgeOutput(text, chunkSize = MAX_BRIDGE_OUTPUT_CHARS) {
+  const chunks = [];
+  for (let start = 0; start < text.length; start += chunkSize) {
+    chunks.push(text.slice(start, start + chunkSize));
+  }
+  return chunks;
+}
+
 const fragment = new URLSearchParams(globalThis.location.hash.slice(1));
 const fragmentToken = fragment.get("token");
 if (fragmentToken) {
@@ -756,16 +770,18 @@ class BrowserSessionBridge {
         let outputPosts = Promise.resolve();
         const postOutput = (stream, text) => {
           const requestId = currentId;
-          outputPosts = outputPosts.then(() =>
-            fetchJson(
-              `/api/notebook/sessions/${this.sessionId}/bridge/output`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ requestId, stream, text }),
-              },
-            ),
-          );
+          for (const chunk of chunkBridgeOutput(text)) {
+            outputPosts = outputPosts.then(() =>
+              fetchJson(
+                `/api/notebook/sessions/${this.sessionId}/bridge/output`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ requestId, stream, text: chunk }),
+                },
+              ),
+            );
+          }
         };
         const postResponse = async (response) => {
           await outputPosts;

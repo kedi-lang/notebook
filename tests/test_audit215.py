@@ -832,3 +832,78 @@ def test_shell_command_uses_cmd_on_windows(monkeypatch: pytest.MonkeyPatch) -> N
         "-lc",
         "pip list | grep foo",
     ]
+
+
+def test_bridge_output_chunks_accumulate(tmp_path: Path) -> None:
+    import threading
+
+    from kedi_notebook.runtime import NotebookSessionManager
+
+    manager = NotebookSessionManager(cwd=tmp_path)
+    session = manager.create(mode="browser")
+    bridge = session.bridge
+    received: list[dict] = []
+
+    def consume() -> None:
+        received.extend(bridge.request_events({"action": "test"}, timeout=5))
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    try:
+        request_payload = bridge.next_request(timeout=2)
+        assert request_payload is not None
+        request_id = request_payload["id"]
+        text = "x" * 150_000
+        # The chunked client posts 64k slices; the server accumulates them.
+        for start in range(0, len(text), 64_000):
+            session.submit_browser_output(
+                request_id, stream="stdout", text=text[start : start + 64_000]
+            )
+        bridge.submit_response(request_id, {"ok": True})
+        worker.join(timeout=2)
+    finally:
+        manager.close_all()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    outputs = [event for event in received if event["type"] == "output"]
+    assert all(len(event["text"]) <= 64_000 for event in outputs)
+    assert "".join(event["text"] for event in outputs) == text
+
+
+def test_bridge_output_endpoint_still_rejects_over_64k(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from kedi_notebook.server import create_app
+
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+    manager = app.state.notebook_manager
+    session = manager.create(mode="browser")
+    try:
+        with TestClient(app, base_url="http://127.0.0.1", raise_server_exceptions=False) as client:
+            oversized = client.post(
+                f"/api/notebook/sessions/{session.id}/bridge/output",
+                json={
+                    "requestId": "r",
+                    "stream": "stdout",
+                    "text": "x" * 64_001,
+                },
+            )
+            assert oversized.status_code == 422
+            # A 64_000-char post passes validation (400 here only because
+            # the request id is not active; the chunked client posts to a
+            # live request).
+            at_limit = client.post(
+                f"/api/notebook/sessions/{session.id}/bridge/output",
+                json={
+                    "requestId": "r",
+                    "stream": "stdout",
+                    "text": "x" * 64_000,
+                },
+            )
+            assert at_limit.status_code == 400
+    finally:
+        manager.close_all()
