@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -20,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -506,18 +507,41 @@ class NotebookSession:
                 raise BridgeCancelled("Notebook session was interrupted")
             self._active_terminal_process = process
         output: Queue[tuple[str, str | None]] = Queue(maxsize=128)
+        stop = threading.Event()
+
+        def put(item: tuple[str, str | None]) -> None:
+            # A full queue must not park a pump thread forever when the
+            # consumer has gone away; drop the item once stopping instead.
+            while not stop.is_set():
+                try:
+                    output.put(item, timeout=0.1)
+                    return
+                except Full:
+                    continue
 
         def pump(stream_name: str, stream: Any) -> None:
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            descriptor = stream.fileno()
             try:
-                while chunk := os.read(stream.fileno(), 4096):
+                # Poll the pipe instead of blocking in os.read(): a
+                # grandchild can hold it open long after the process dies,
+                # and only the stop event ends the wait then.
+                while not stop.is_set():
+                    ready, _, _ = select.select([descriptor], [], [], 0.1)
+                    if not ready:
+                        continue
+                    chunk = os.read(descriptor, 4096)
+                    if not chunk:
+                        break
                     if text := decoder.decode(chunk):
-                        output.put((stream_name, text))
+                        put((stream_name, text))
                 if text := decoder.decode(b"", final=True):
-                    output.put((stream_name, text))
+                    put((stream_name, text))
+            except (OSError, ValueError):
+                pass
             finally:
                 stream.close()
-                output.put((stream_name, None))
+                put((stream_name, None))
 
         if process.stdout is None or process.stderr is None:
             process.kill()
@@ -548,6 +572,7 @@ class NotebookSession:
             return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
             yield {"type": "command_result", "returnCode": return_code}
         finally:
+            stop.set()
             with self._state_lock:
                 if self._active_terminal_process is process:
                     self._active_terminal_process = None
@@ -558,6 +583,8 @@ class NotebookSession:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=1)
+            for reader in readers:
+                reader.join(timeout=2)
 
     def _host_process_env(self) -> dict[str, str]:
         if self.python is None:

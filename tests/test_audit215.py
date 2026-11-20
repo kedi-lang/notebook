@@ -320,3 +320,69 @@ def test_host_worker_ignores_forged_fd1_reply(tmp_path: Path) -> None:
         assert following.get("result") == 2
     finally:
         bridge.close()
+
+
+def _stub_stream_session(tmp_path: Path):
+    import sys
+    import threading
+
+    from kedi_notebook.runtime import HostPython, NotebookSession
+
+    session = object.__new__(NotebookSession)
+    session.python = HostPython(
+        id="python-1", executable=sys.executable, version="3.12.0", label="stub"
+    )
+    session._state_lock = threading.Lock()
+    session._closed = False
+    session._active_terminal_process = None
+    session.cwd = tmp_path
+    return session
+
+
+def _live_thread_idents() -> set[int]:
+    import threading
+
+    return {thread.ident for thread in threading.enumerate() if thread.is_alive()}
+
+
+def _open_fd_count() -> int:
+    import os
+
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_stream_host_process_releases_threads_and_fds(tmp_path: Path) -> None:
+    import subprocess
+    import time
+
+    # (a) A grandchild holds the pipe open past the timeout.
+    session = _stub_stream_session(tmp_path)
+    threads_before = _live_thread_idents()
+    fds_before = _open_fd_count()
+    with pytest.raises(subprocess.TimeoutExpired):
+        list(
+            session._stream_host_process(
+                ["/bin/sh", "-lc", "sleep 30 & echo hi"],
+                command="sleep 30 & echo hi",
+                timeout=2,
+            )
+        )
+    time.sleep(2)
+    assert _live_thread_idents() <= threads_before
+    assert _open_fd_count() <= fds_before
+
+    # (b) The consumer abandons a fast-producing stream.
+    session = _stub_stream_session(tmp_path)
+    threads_before = _live_thread_idents()
+    fds_before = _open_fd_count()
+    generator = session._stream_host_process(
+        ["/bin/sh", "-lc", "seq 1 200000"],
+        command="seq 1 200000",
+        timeout=30,
+    )
+    first = next(generator)
+    assert first["type"] == "output"
+    generator.close()
+    time.sleep(2)
+    assert _live_thread_idents() <= threads_before
+    assert _open_fd_count() <= fds_before
