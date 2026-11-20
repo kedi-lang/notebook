@@ -1,4 +1,9 @@
 import { loadPyodide } from "./vendor/pyodide/pyodide.mjs";
+import {
+  OPTIONAL_PACKAGES,
+  UNSUPPORTED_PACKAGES,
+  codeUsesPackage,
+} from "./optional-packages.js";
 
 const PYODIDE_INDEX_URL = new URL("./vendor/pyodide/", import.meta.url).href;
 
@@ -67,10 +72,10 @@ try:
         json.loads(__kedi_terminal_command_json)
     )
     if __kedi_terminal["kind"] == "install":
-        kediStreamOutput(
-            "stdout",
-            "Installing " + ", ".join(__kedi_terminal["packages"]) + "...\n",
+        __kedi_installing = (
+            "Installing " + ", ".join(__kedi_terminal["packages"]) + "...\n"
         )
+        kediStreamOutput("stdout", __kedi_installing)
         await micropip.install(__kedi_terminal["packages"])
         __kedi_note = (
             " Project files are unchanged."
@@ -85,9 +90,12 @@ try:
             + "\n"
         )
         kediStreamOutput("stdout", __kedi_output)
+        # The response stdout must be the full output, not just the final
+        # line: the host strips the already-streamed prefix from it, so a
+        # partial stdout made "Installed ..." appear twice.
         __kedi_terminal_response = {
             "ok": True,
-            "stdout": __kedi_output,
+            "stdout": __kedi_installing + __kedi_output,
             "stderr": "",
         }
     elif __kedi_terminal["kind"] == "list":
@@ -141,14 +149,20 @@ async function initializePyodide() {
 }
 
 async function ensureOptionalPackages(pyodide, request) {
-  const serialized = JSON.stringify(request);
-  if (serialized.includes("pydantic_monty")) {
-    throw new Error(
-      "pydantic_monty is not supported by the Pyodide runtime; use server sandbox execution",
-    );
+  // Check the cell code only: a mention in a string, comment or variable
+  // name (or an env value) must not trigger an install or an error.
+  const code = typeof request?.code === "string" ? request.code : "";
+  for (const name of UNSUPPORTED_PACKAGES) {
+    if (codeUsesPackage(code, name)) {
+      throw new Error(
+        `${name} is not supported by the Pyodide runtime; use server sandbox execution`,
+      );
+    }
   }
-  if (serialized.includes("logfire")) {
-    await installLogfire(pyodide);
+  for (const name of OPTIONAL_PACKAGES) {
+    if (codeUsesPackage(code, name)) {
+      await installLogfire(pyodide);
+    }
   }
 }
 

@@ -2037,3 +2037,105 @@ def test_notebook_secret_store_refuses_broken_symlink(tmp_path: Path) -> None:
     real_path.symlink_to(tmp_path / "missing-target")
     with pytest.raises(RuntimeError, match="cannot be a symbolic link"):
         real.set("OTHER", "value")
+
+
+def _run_pyodide_terminal_driver(
+    monkeypatch: pytest.MonkeyPatch, command: str
+) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+    """Run the TERMINAL_DRIVER shipped inside pyodide-worker.js in CPython."""
+    import textwrap
+    import types as stdlib_types
+
+    source = Path("src/kedi_notebook/static/pyodide-worker.js").read_text(encoding="utf-8")
+    marker = "const TERMINAL_DRIVER = String.raw`"
+    start = source.index(marker) + len(marker)
+    end = source.index("\n`;", start)
+    driver = source[start:end]
+
+    streamed: list[tuple[str, str]] = []
+    installed: list[list[str]] = []
+
+    micropip = stdlib_types.ModuleType("micropip")
+
+    async def install(packages: list[str]) -> None:
+        installed.append(list(packages))
+
+    micropip.install = install
+    monkeypatch.setitem(sys.modules, "micropip", micropip)
+
+    namespace: dict[str, Any] = {
+        "__name__": "pyodide_terminal_driver_test",
+        "__kedi_terminal_command_json": json.dumps(command),
+        "kediStreamOutput": lambda stream, text: streamed.append((stream, text)),
+    }
+    wrapped = "async def __kedi_terminal_driver():\n" + textwrap.indent(driver, "    ")
+    wrapped += "\n    return __kedi_terminal_response\n"
+    exec(compile(wrapped, "<pyodide-worker-terminal>", "exec"), namespace)  # noqa: S102
+    response = asyncio.run(namespace["__kedi_terminal_driver"]())
+    return response, streamed
+
+
+# Audit #215 item 13: the install response must repeat the streamed output so
+# the host dedup strips it, instead of showing "Installed ..." twice.
+def test_pyodide_terminal_install_response_repeats_streamed_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response, streamed = _run_pyodide_terminal_driver(monkeypatch, "pip install foo")
+
+    assert response["ok"] is True
+    assert streamed == [
+        ("stdout", "Installing foo...\n"),
+        ("stdout", "Installed foo in the browser runtime.\n"),
+    ]
+    assert response["stdout"] == "".join(text for _, text in streamed)
+
+
+def test_browser_terminal_install_output_appears_once(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(cwd=tmp_path)
+    session = manager.create(mode="browser")
+    release_response = threading.Event()
+
+    def serve_terminal() -> None:
+        request = session.next_browser_request(timeout=1)
+        assert request is not None
+        request_id = request.pop("id")
+        assert request == {"action": "execute_terminal", "command": "pip install foo"}
+        session.submit_browser_output(request_id, stream="stdout", text="Installing foo...\n")
+        session.submit_browser_output(
+            request_id, stream="stdout", text="Installed foo in the browser runtime.\n"
+        )
+        assert release_response.wait(timeout=2)
+        session.submit_browser_response(
+            request_id,
+            {
+                "ok": True,
+                "stdout": "Installing foo...\nInstalled foo in the browser runtime.\n",
+                "stderr": "",
+            },
+        )
+
+    worker = threading.Thread(target=serve_terminal)
+    worker.start()
+    try:
+        events = session.stream_terminal(cell_id="packages", source="!pip install foo")
+        first = next(events)
+        assert first == {
+            "type": "output",
+            "stream": "stdout",
+            "text": "Installing foo...\n",
+        }
+        release_response.set()
+        remaining = list(events)
+    finally:
+        release_response.set()
+        manager.close_all()
+        worker.join(timeout=2)
+
+    outputs = [
+        event
+        for event in [first, *remaining]
+        if event.get("type") == "output" and event.get("stream") == "stdout"
+    ]
+    combined = "".join(event["text"] for event in outputs)
+    assert combined == "Installing foo...\nInstalled foo in the browser runtime.\n"
+    assert combined.count("Installed foo in the browser runtime.\n") == 1
