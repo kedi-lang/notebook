@@ -1823,3 +1823,123 @@ def test_stream_host_process_abandoned_generator_releases_threads_and_fds(
         _assert_resources_released(before_threads, before_fds)
     finally:
         manager.close_all()
+
+
+# Audit #215 item 10: worker string corruption, cycles, registry bound.
+def test_sandbox_worker_keeps_multiline_string_contents() -> None:
+    response = handle_request(
+        {
+            "action": "execute_block",
+            "code": 'x = """\nalpha\nbeta\n"""',
+            "syncNames": ["x"],
+            "env": {},
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["env"] == {"x": "\nalpha\nbeta\n"}
+
+
+def test_sandbox_worker_turns_cyclic_values_into_references() -> None:
+    import kedi_notebook.sandbox_worker as worker
+
+    created = handle_request(
+        {
+            "action": "execute_block",
+            "code": 'd = {}\nd["self"] = d',
+            "syncNames": ["d"],
+            "env": {},
+        }
+    )
+    assert created["ok"] is True
+    ref = created["env"]["d"]
+    assert set(ref) == {"__kedi_notebook_ref__"}
+    handle = ref["__kedi_notebook_ref__"]
+    assert isinstance(handle, str)
+    assert worker._OBJECT_REGISTRY[handle]["self"] is worker._OBJECT_REGISTRY[handle]
+
+    # The same value as an inline result fails clearly instead of RecursionError.
+    evaluated = handle_request(
+        {"action": "evaluate_inline", "code": "d", "syncNames": [], "env": {}},
+    )
+    assert evaluated["ok"] is False
+    assert "Cyclic" in evaluated["error"]
+    assert "RecursionError" not in evaluated["error"]
+
+
+def test_sandbox_worker_object_registry_is_bounded() -> None:
+    import kedi_notebook.sandbox_worker as worker
+
+    saved = dict(worker._OBJECT_REGISTRY)
+    try:
+        worker._OBJECT_REGISTRY.clear()
+        handles = [worker._register_object(object()) for _ in range(1100)]
+        assert len(set(handles)) == 1100
+        assert len(worker._OBJECT_REGISTRY) <= 1024
+        # Oldest entries are evicted first.
+        assert handles[0] not in worker._OBJECT_REGISTRY
+        assert handles[-1] in worker._OBJECT_REGISTRY
+    finally:
+        worker._OBJECT_REGISTRY.clear()
+        worker._OBJECT_REGISTRY.update(saved)
+
+
+def _load_pyodide_driver_namespace(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Execute the Python DRIVER_SETUP shipped inside pyodide-worker.js."""
+    import types as stdlib_types
+
+    source = Path("src/kedi_notebook/static/pyodide-worker.js").read_text(encoding="utf-8")
+    marker = "const DRIVER_SETUP = String.raw`"
+    start = source.index(marker) + len(marker)
+    end = source.index("\n`;", start)
+    driver = source[start:end]
+    js = stdlib_types.ModuleType("js")
+    js.kediExchange = lambda message: "{}"
+    js.kediStreamOutput = lambda stream, text: None
+    monkeypatch.setitem(sys.modules, "js", js)
+    namespace: dict[str, Any] = {"__name__": "pyodide_driver_test"}
+    exec(compile(driver, "<pyodide-worker-driver>", "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+def test_pyodide_worker_keeps_multiline_string_contents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_pyodide_driver_namespace(monkeypatch)
+    namespace: dict[str, Any] = {}
+    driver["_run_block"](namespace, 'x = """\nalpha\nbeta\n"""', ["x"])
+
+    assert namespace["x"] == "\nalpha\nbeta\n"
+
+
+def test_pyodide_worker_turns_cyclic_values_into_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_pyodide_driver_namespace(monkeypatch)
+    namespace: dict[str, Any] = {}
+    driver["_run_block"](namespace, 'd = {}\nd["self"] = d', ["d"])
+    encoded = driver["_serializable_namespace"](namespace, ["d"])
+
+    assert set(encoded["d"]) == {"__kedi_notebook_ref__"}
+    handle = encoded["d"]["__kedi_notebook_ref__"]
+    assert driver["_OBJECT_REGISTRY"][handle] is namespace["d"]
+    with pytest.raises(TypeError, match="Cyclic"):
+        driver["_to_json"](namespace["d"])
+
+
+def test_pyodide_worker_object_registry_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_pyodide_driver_namespace(monkeypatch)
+    registry = driver["_OBJECT_REGISTRY"]
+    saved = dict(registry)
+    try:
+        registry.clear()
+        handles = [driver["_register_object"](object()) for _ in range(1100)]
+        assert len(set(handles)) == 1100
+        assert len(registry) <= 1024
+        assert handles[0] not in registry
+        assert handles[-1] in registry
+    finally:
+        registry.clear()
+        registry.update(saved)

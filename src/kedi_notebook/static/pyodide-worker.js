@@ -258,6 +258,7 @@ function readStdin() {
 }
 
 const DRIVER_SETUP = String.raw`
+import ast
 import builtins
 import contextlib
 import io
@@ -273,6 +274,10 @@ from pydantic import BaseModel
 _REFERENCE_KEY = "__kedi_notebook_ref__"
 _PROCEDURE_KEY = "__kedi_playground_procedure__"
 _OBJECT_REGISTRY = globals().setdefault("__kedi_object_registry", {})
+# Monotonic handles (never reused): evicted objects may be garbage-collected,
+# so an id-based handle could later resolve to a different object.
+_NEXT_HANDLE = globals().setdefault("__kedi_object_registry_next", [1])
+_MAX_OBJECT_REGISTRY = 1024
 # Output captured by each request being handled; nested requests stack on top.
 _CAPTURES = []
 # Requests whose Python may write Kedi bindings: only changed values are sent back.
@@ -332,7 +337,7 @@ class _KediOutput(io.StringIO):
         return written
 
 
-def _to_json(value):
+def _to_json(value, _seen=frozenset()):
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, _KediProcedure):
@@ -340,18 +345,37 @@ def _to_json(value):
     if callable(value):
         raise TypeError(f"Python callable {value!r} requires an opaque bridge reference")
     if isinstance(value, dict):
+        if id(value) in _seen:
+            raise TypeError("Cyclic mappings cannot cross the notebook bridge")
+        seen = _seen | {id(value)}
         if not all(isinstance(key, str) for key in value):
             raise TypeError("Playground mappings require string keys")
-        return {key: _to_json(item) for key, item in value.items()}
+        return {key: _to_json(item, seen) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_to_json(item) for item in value]
+        if id(value) in _seen:
+            raise TypeError("Cyclic sequences cannot cross the notebook bridge")
+        seen = _seen | {id(value)}
+        return [_to_json(item, seen) for item in value]
     if hasattr(value, "__dict__") and not isinstance(value, (type, types.ModuleType)):
+        if id(value) in _seen:
+            raise TypeError("Cyclic objects cannot cross the notebook bridge")
+        seen = _seen | {id(value)}
         return {
-            key: _to_json(item)
+            key: _to_json(item, seen)
             for key, item in vars(value).items()
             if not key.startswith("_")
         }
     raise TypeError(f"Python value {type(value).__name__} cannot cross the notebook bridge")
+
+
+def _register_object(value):
+    """Keep ``value`` across the bridge, evicting the oldest entry when full."""
+    handle = str(_NEXT_HANDLE[0])
+    _NEXT_HANDLE[0] += 1
+    if len(_OBJECT_REGISTRY) >= _MAX_OBJECT_REGISTRY:
+        _OBJECT_REGISTRY.pop(next(iter(_OBJECT_REGISTRY)))
+    _OBJECT_REGISTRY[handle] = value
+    return handle
 
 
 def _type_descriptor(value):
@@ -403,12 +427,30 @@ def _type_descriptor(value):
 
 
 def _run_block(namespace, code, sync_names):
-    header = ["def __kedi_wrapper__():"]
+    # Wrap the block as a function via the AST instead of indenting its lines:
+    # indenting rewrote the contents of multi-line string literals (every
+    # continuation line gained four spaces).
+    tree = ast.parse(code)
+    body = tree.body
     if sync_names:
-        header.append(f"    global {', '.join(sync_names)}")
-    body = [f"    {line}" for line in code.splitlines()]
-    source = "\n".join(header + body + ["    pass"])
-    exec(compile(source, "<kedi-pyodide:block>", "exec"), namespace, namespace)
+        body = [ast.Global(names=list(sync_names)), *body]
+    func = ast.FunctionDef(
+        name="__kedi_wrapper__",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[],
+            vararg=None,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[],
+        ),
+        body=body or [ast.Pass()],
+        decorator_list=[],
+    )
+    module = ast.Module(body=[func], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, "<kedi-pyodide:block>", "exec"), namespace, namespace)
     wrapper = namespace.pop("__kedi_wrapper__")
     return wrapper()
 
@@ -423,9 +465,7 @@ def _serializable_namespace(namespace, names, installed=None):
         try:
             encoded = _to_json(value)
         except TypeError:
-            handle = str(id(value))
-            _OBJECT_REGISTRY[handle] = value
-            encoded = {_REFERENCE_KEY: handle}
+            encoded = {_REFERENCE_KEY: _register_object(value)}
         if installed is None or name not in installed or installed[name] != encoded:
             result[name] = encoded
     return result

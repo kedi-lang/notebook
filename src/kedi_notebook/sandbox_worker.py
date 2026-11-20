@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import builtins
 import contextlib
 import io
+import itertools
 import json
 import os
 import sys
@@ -33,6 +35,10 @@ _PROCEDURE_KEY = "__kedi_playground_procedure__"
 _MEDIA_KEY = "__kedi_media__"  # kedi.media.BRIDGE_KEY
 _RESPONSE_PREFIX = "__KEDI_NOTEBOOK_RESPONSE__"
 _OBJECT_REGISTRY: dict[str, Any] = {}
+# Monotonic handles (never reused): evicted objects may be garbage-collected,
+# so an id-based handle could later resolve to a different object.
+_NEXT_HANDLE = itertools.count(1)
+_MAX_OBJECT_REGISTRY = 1024
 # The bridge protocol keeps the process streams while user output is redirected.
 _PROTOCOL_IN = sys.stdin
 _PROTOCOL_OUT = sys.stdout
@@ -117,7 +123,7 @@ def _from_json(value: Any) -> Any:
     return value
 
 
-def _to_json(value: Any) -> Any:
+def _to_json(value: Any, _seen: frozenset[int] = frozenset()) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, _KediProcedure):
@@ -129,14 +135,36 @@ def _to_json(value: Any) -> Any:
     if callable(value):
         raise TypeError(f"Python callable {value!r} requires an opaque bridge reference")
     if isinstance(value, Mapping):
+        if id(value) in _seen:
+            raise TypeError("Cyclic mappings cannot cross the sandbox bridge")
+        seen = _seen | {id(value)}
         if not all(isinstance(key, str) for key in value):
             raise TypeError("Sandbox mappings require string keys")
-        return {key: _to_json(item) for key, item in value.items()}
+        return {key: _to_json(item, seen) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_to_json(item) for item in value]
+        if id(value) in _seen:
+            raise TypeError("Cyclic sequences cannot cross the sandbox bridge")
+        seen = _seen | {id(value)}
+        return [_to_json(item, seen) for item in value]
     if hasattr(value, "__dict__") and not isinstance(value, (type, types.ModuleType)):
-        return {key: _to_json(item) for key, item in vars(value).items() if not key.startswith("_")}
+        if id(value) in _seen:
+            raise TypeError("Cyclic objects cannot cross the sandbox bridge")
+        seen = _seen | {id(value)}
+        return {
+            key: _to_json(item, seen)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
     raise TypeError(f"Python value {type(value).__name__} cannot cross the sandbox bridge")
+
+
+def _register_object(value: Any) -> str:
+    """Keep ``value`` across the bridge, evicting the oldest entry when full."""
+    handle = str(next(_NEXT_HANDLE))
+    if len(_OBJECT_REGISTRY) >= _MAX_OBJECT_REGISTRY:
+        _OBJECT_REGISTRY.pop(next(iter(_OBJECT_REGISTRY)))
+    _OBJECT_REGISTRY[handle] = value
+    return handle
 
 
 def _type_descriptor(value: Any) -> dict[str, Any]:
@@ -189,12 +217,30 @@ def _type_descriptor(value: Any) -> dict[str, Any]:
 
 
 def _run_block(namespace: dict[str, Any], code: str, sync_names: list[str]) -> Any:
-    header = ["def __kedi_wrapper__():"]
+    # Wrap the block as a function via the AST instead of indenting its lines:
+    # indenting rewrote the contents of multi-line string literals (every
+    # continuation line gained four spaces).
+    tree = ast.parse(code)
+    body: list[ast.stmt] = tree.body
     if sync_names:
-        header.append(f"    global {', '.join(sync_names)}")
-    body = [f"    {line}" for line in code.splitlines()]
-    source = "\n".join(header + body + ["    pass"])
-    exec(compile(source, "<kedi-sandbox:block>", "exec"), namespace, namespace)
+        body = [ast.Global(names=list(sync_names)), *body]
+    func = ast.FunctionDef(
+        name="__kedi_wrapper__",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[],
+            vararg=None,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[],
+        ),
+        body=body or [ast.Pass()],
+        decorator_list=[],
+    )
+    module = ast.Module(body=[func], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, "<kedi-sandbox:block>", "exec"), namespace, namespace)
     wrapper = namespace.pop("__kedi_wrapper__")
     return wrapper()
 
@@ -213,9 +259,7 @@ def _serializable_namespace(
         try:
             encoded = _to_json(value)
         except TypeError:
-            handle = str(id(value))
-            _OBJECT_REGISTRY[handle] = value
-            encoded = {_REFERENCE_KEY: handle}
+            encoded = {_REFERENCE_KEY: _register_object(value)}
         if installed is None or name not in installed or installed[name] != encoded:
             result[name] = encoded
     return result
