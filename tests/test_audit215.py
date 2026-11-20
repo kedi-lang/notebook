@@ -698,3 +698,137 @@ def test_bridge_manager_is_removed() -> None:
 
     assert not hasattr(bridge, "BridgeManager")
     assert "BridgeManager" not in bridge.__all__
+
+
+def test_session_manager_close_all_waits_for_session_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    import time
+
+    import kedi_notebook.runtime as runtime_module
+    from kedi_notebook.runtime import NotebookSessionManager
+
+    real_session_cls = runtime_module.NotebookSession
+    closed: list[str] = []
+
+    class SlowSession:
+        def __init__(self, *args, **kwargs):
+            time.sleep(0.4)  # Construction window: bridges starting.
+            self.id = kwargs.get("session_id") or "slow-1"
+
+        def close(self) -> None:
+            closed.append(self.id)
+
+    monkeypatch.setattr(runtime_module, "NotebookSession", SlowSession)
+    manager = NotebookSessionManager(cwd=tmp_path)
+    created: dict[str, object] = {}
+
+    def create() -> None:
+        created["session"] = manager.create(mode="browser")
+
+    worker = threading.Thread(target=create)
+    worker.start()
+    time.sleep(0.1)  # create() is inside the constructor, not yet registered.
+    manager.close_all()
+    worker.join()
+    monkeypatch.setattr(runtime_module, "NotebookSession", real_session_cls)
+
+    assert created["session"].id not in manager._sessions
+    assert closed == [created["session"].id]
+
+
+def test_terminal_pipes_run_through_the_shell(tmp_path: Path) -> None:
+    import sys
+    import threading
+
+    import kedi_notebook.runtime as runtime_module
+    from kedi_notebook.runtime import HostPython, NotebookSession
+
+    seen_argv: list[list[str]] = []
+
+    def fake_stream(self, argv, *, command, timeout=120.0):
+        seen_argv.append(list(argv))
+        yield {"type": "command_result", "returnCode": 0}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(runtime_module.NotebookSession, "_stream_host_process", fake_stream)
+    try:
+        session = object.__new__(NotebookSession)
+        session.python = HostPython(
+            id="python-1", executable=sys.executable, version="3.12.0", label="stub"
+        )
+        session._state_lock = threading.Lock()
+        session._closed = False
+        session._active_terminal_process = None
+        session.cwd = tmp_path
+        session.mode = "host"
+        session._execution_lock = threading.Lock()
+        session._attempt = 0
+        session._execution_count = 0
+        session._last_activity = 0
+        session.touch = lambda: None
+        list(session.stream_terminal(cell_id="c1", source="!pip list | grep foo"))
+        list(session.stream_terminal(cell_id="c2", source="!pip list"))
+        list(session.stream_terminal(cell_id="c3", source="!echo hi"))
+    finally:
+        monkeypatch.undo()
+
+    assert seen_argv[0] == ["/bin/sh", "-lc", "pip list | grep foo"]
+    assert seen_argv[1] == [sys.executable, "-m", "pip", "list"]
+    assert seen_argv[2] == ["/bin/sh", "-lc", "echo hi"]
+
+
+def test_terminal_pipe_filters_output_end_to_end(tmp_path: Path) -> None:
+    import sys
+
+    from kedi_notebook.host_environment import PreparedHostEnvironment
+    from kedi_notebook.runtime import NotebookSessionManager
+
+    class _PassthroughHostEnvironment:
+        def prepare(self, *, executable, version, cwd):
+            del version, cwd
+            python = Path(executable)
+            return PreparedHostEnvironment(executable, str(python.parent.parent))
+
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PassthroughHostEnvironment(),
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        matched = session.execute_terminal(
+            cell_id="pipe",
+            source="!python -c \"print('hello')\" | grep hello",
+        )
+        missed = session.execute_terminal(
+            cell_id="pipe-miss",
+            source="!python -c \"print('hello')\" | grep zzz",
+        )
+    finally:
+        manager.close_all()
+
+    assert matched["ok"] is True
+    assert matched["stdout"] == "hello\n"
+    assert missed["ok"] is False
+
+
+def test_shell_command_uses_cmd_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from kedi_notebook.runtime import _shell_command
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setenv("COMSPEC", "C:\\Windows\\System32\\cmd.exe")
+    assert _shell_command("pip list | findstr foo") == [
+        "C:\\Windows\\System32\\cmd.exe",
+        "/c",
+        "pip list | findstr foo",
+    ]
+    monkeypatch.setattr(os, "name", "posix")
+    assert _shell_command("pip list | grep foo") == [
+        "/bin/sh",
+        "-lc",
+        "pip list | grep foo",
+    ]

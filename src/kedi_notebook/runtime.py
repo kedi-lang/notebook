@@ -410,12 +410,14 @@ class NotebookSession:
         if not tokens:
             raise ValueError("Terminal command cannot be empty")
         executable = self.python.executable
-        if tokens[0] in {"pip", "pip3"}:
+        if _has_shell_operators(command):
+            argv = _shell_command(command)
+        elif tokens[0] in {"pip", "pip3"}:
             argv = [executable, "-m", "pip", *tokens[1:]]
         elif tokens[0] in {"python", "python3"}:
             argv = [executable, *tokens[1:]]
         else:
-            argv = ["/bin/sh", "-lc", command]
+            argv = _shell_command(command)
 
         yield from self._stream_host_process(argv, command=command)
 
@@ -658,7 +660,8 @@ class NotebookSessionManager:
         self._host_environment = host_environment or HostEnvironmentManager()
         self._interactive_options = dict(interactive_options or {})
         self._sessions: dict[str, NotebookSession] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.Condition(threading.Lock())
+        self._creating = 0
 
     def create(
         self,
@@ -687,16 +690,26 @@ class NotebookSessionManager:
                 environment=prepared.directory,
             )
         session_id = uuid4().hex
-        session = NotebookSession(
-            session_id=session_id,
-            mode=mode,
-            cwd=self.cwd,
-            python=python,
-            interactive_options=self._interactive_options,
-            session_snapshot=session_snapshot,
-        )
+        with self._lock:
+            self._creating += 1
+        try:
+            session = NotebookSession(
+                session_id=session_id,
+                mode=mode,
+                cwd=self.cwd,
+                python=python,
+                interactive_options=self._interactive_options,
+                session_snapshot=session_snapshot,
+            )
+        except BaseException:
+            with self._lock:
+                self._creating -= 1
+                self._lock.notify_all()
+            raise
         with self._lock:
             self._sessions[session_id] = session
+            self._creating -= 1
+            self._lock.notify_all()
         return session
 
     def get(self, session_id: str) -> NotebookSession:
@@ -715,6 +728,8 @@ class NotebookSessionManager:
 
     def close_all(self) -> None:
         with self._lock:
+            while self._creating:
+                self._lock.wait()
             sessions = list(self._sessions.values())
             self._sessions.clear()
         for session in sessions:
@@ -722,6 +737,8 @@ class NotebookSessionManager:
 
     def reconfigure(self, *, interactive_options: Mapping[str, Any]) -> None:
         with self._lock:
+            while self._creating:
+                self._lock.wait()
             sessions = list(self._sessions.values())
             self._sessions.clear()
             self._interactive_options = dict(interactive_options)
@@ -1033,6 +1050,46 @@ def _requires_runtime_reset(exc: BaseException) -> bool:
             if isinstance(original, BaseException)
             else current.__cause__ or current.__context__
         )
+    return False
+
+
+def _shell_command(command: str) -> list[str]:
+    if os.name == "nt":
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", command]
+    return ["/bin/sh", "-lc", command]
+
+
+_SHELL_OPERATORS = frozenset("|&;<>()$`")
+
+
+def _has_shell_operators(command: str) -> bool:
+    """True when the command needs a shell to interpret it.
+
+    Pipes, redirects, chaining, backgrounding and command substitution are
+    shell syntax: passing them as literal argv tokens to pip/python silently
+    drops or ignores them (pip ignores the extra args and exits 0). The scan
+    respects single/double quotes and backslash escapes, so a quoted operator
+    (``python -c "print('|')"``) stays a literal argument.
+    """
+
+    in_single = False
+    in_double = False
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if not in_single and not in_double and char in _SHELL_OPERATORS:
+            return True
     return False
 
 
