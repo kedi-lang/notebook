@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
@@ -48,17 +49,22 @@ class NotebookSecretStore:
             if configured_path
             else Path.home() / ".kedi" / "notebook" / "secrets.json"
         )
+        # Guards the read-modify-write of set_many/delete: without it,
+        # concurrent writers silently lost each other's keys.
+        self._lock = threading.Lock()
         self._values = self._read()
         self._previous_environment: dict[str, str | None] = {}
 
     @property
     def names(self) -> tuple[str, ...]:
-        return tuple(sorted(self._values))
+        with self._lock:
+            return tuple(sorted(self._values))
 
     def apply_to_environment(self) -> None:
-        for name, value in self._values.items():
-            self._remember_environment(name)
-            os.environ[name] = value
+        with self._lock:
+            for name, value in self._values.items():
+                self._remember_environment(name)
+                os.environ[name] = value
 
     def set(self, name: str, value: str) -> None:
         self.set_many({name: value})
@@ -70,28 +76,30 @@ class NotebookSecretStore:
             _validate_name(name)
             _validate_not_process_control(name)
             _validate_value(value)
-        updated = dict(self._values)
-        updated.update(values)
-        self._write(updated)
-        self._values = updated
-        for name, value in values.items():
-            self._remember_environment(name)
-            os.environ[name] = value
+        with self._lock:
+            updated = dict(self._values)
+            updated.update(values)
+            self._write(updated)
+            self._values = updated
+            for name, value in values.items():
+                self._remember_environment(name)
+                os.environ[name] = value
         return tuple(sorted(values))
 
     def delete(self, name: str) -> bool:
         _validate_name(name)
-        if name not in self._values:
-            return False
-        updated = dict(self._values)
-        del updated[name]
-        self._write(updated)
-        self._values = updated
-        previous = self._previous_environment.pop(name, None)
-        if previous is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = previous
+        with self._lock:
+            if name not in self._values:
+                return False
+            updated = dict(self._values)
+            del updated[name]
+            self._write(updated)
+            self._values = updated
+            previous = self._previous_environment.pop(name, None)
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
         return True
 
     def _remember_environment(self, name: str) -> None:
@@ -99,10 +107,10 @@ class NotebookSecretStore:
             self._previous_environment[name] = os.environ.get(name)
 
     def _read(self) -> dict[str, str]:
-        if not self.path.exists():
-            return {}
         if self.path.is_symlink():
             raise RuntimeError("Notebook secret store cannot be a symbolic link")
+        if not self.path.exists():
+            return {}
         os.chmod(self.path, 0o600)
         if self.path.stat().st_size > _MAX_FILE_BYTES:
             raise RuntimeError("Notebook secret store is larger than 1 MB")
@@ -134,10 +142,24 @@ class NotebookSecretStore:
     def _write(self, values: dict[str, str]) -> None:
         if len(values) > _MAX_SECRETS:
             raise ValueError(f"At most {_MAX_SECRETS} notebook environment values may be stored")
+        # The store refuses to read files over 1 MB, so it must never write
+        # one either: nine maximum-size values used to produce a file the
+        # next load rejected as "larger than 1 MB".
+        payload = (
+            json.dumps(
+                {"version": 1, "secrets": values},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        if len(payload.encode("utf-8")) > _MAX_FILE_BYTES:
+            raise ValueError("Notebook secret store would exceed 1 MB")
         parent = self.path.parent
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(parent, 0o700)
-        if self.path.exists() and self.path.is_symlink():
+        if self.path.is_symlink():
             raise RuntimeError("Notebook secret store cannot be a symbolic link")
 
         descriptor, temporary_name = tempfile.mkstemp(prefix=".secrets-", dir=parent)
@@ -145,14 +167,7 @@ class NotebookSecretStore:
         try:
             os.chmod(temporary_path, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(
-                    {"version": 1, "secrets": values},
-                    stream,
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                stream.write("\n")
+                stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary_path, self.path)

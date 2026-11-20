@@ -1980,3 +1980,60 @@ def test_notebook_lsp_endpoints_fall_back_to_kedi_when_pyright_fails(
     assert prepared.json()["provider"] == "kedi"
     assert renamed.status_code == 200
     assert renamed.json()["provider"] == "kedi"
+
+
+# Audit #215 item 12: secret store lock, symlink check, self-blocking size.
+def test_notebook_secret_store_keeps_concurrent_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "secrets.json"
+    store = NotebookSecretStore(path)
+
+    def write_batch(thread_index: int) -> None:
+        for item_index in range(50):
+            store.set(f"KEY_{thread_index}_{item_index}", "value")
+
+    workers = [threading.Thread(target=write_batch, args=(index,)) for index in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=30)
+    assert not any(worker.is_alive() for worker in workers)
+
+    reloaded = NotebookSecretStore(path)
+    assert len(reloaded.names) == 200
+
+
+def test_notebook_secret_store_rejects_writes_it_could_not_read_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "secrets.json"
+    store = NotebookSecretStore(path)
+    value = "x" * 128_000
+    for index in range(7):
+        store.set(f"LARGE_{index}", value)
+    assert path.stat().st_size <= 1_000_000
+
+    with pytest.raises(ValueError, match="would exceed 1 MB"):
+        store.set("LARGE_7", value)
+
+    # The file on disk still loads: the store never blocks itself.
+    assert len(NotebookSecretStore(path).names) == 7
+
+
+def test_notebook_secret_store_refuses_broken_symlink(tmp_path: Path) -> None:
+    path = tmp_path / "secrets.json"
+    path.symlink_to(tmp_path / "missing-target")
+
+    with pytest.raises(RuntimeError, match="cannot be a symbolic link"):
+        NotebookSecretStore(path)
+
+    real = NotebookSecretStore(tmp_path / "real.json")
+    real.set("KEPT", "value")
+    real_path = tmp_path / "real.json"
+    real_path.unlink()
+    real_path.symlink_to(tmp_path / "missing-target")
+    with pytest.raises(RuntimeError, match="cannot be a symbolic link"):
+        real.set("OTHER", "value")
