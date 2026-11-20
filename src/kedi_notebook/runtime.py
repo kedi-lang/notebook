@@ -4,6 +4,7 @@ import base64
 import binascii
 import codecs
 import json
+import math
 import os
 import re
 import shlex
@@ -842,10 +843,18 @@ def _json_result(value: object) -> dict[str, object] | None:
     if media is not None:
         return media
     try:
-        serialized = json.dumps(value)
+        serialized = json.dumps(value, allow_nan=False)
+        display_value: object = value
     except (TypeError, ValueError):
-        rendered = _truncate_output(repr(value))
-        return {"kind": "repr", "type": type(value).__name__, "value": rendered}
+        try:
+            # Non-finite floats (NaN/Infinity) cannot cross JSONResponse,
+            # which renders with allow_nan=False. Show them as text instead
+            # of failing the cell.
+            display_value = _sanitize_json(value)
+            serialized = json.dumps(display_value, allow_nan=False)
+        except (TypeError, ValueError):
+            rendered = _truncate_output(repr(value))
+            return {"kind": "repr", "type": type(value).__name__, "value": rendered}
     if len(serialized) > _OUTPUT_LIMIT:
         return {
             "kind": "repr",
@@ -853,7 +862,31 @@ def _json_result(value: object) -> dict[str, object] | None:
             "value": _truncate_output(serialized),
             "truncated": True,
         }
-    return {"kind": "json", "type": type(value).__name__, "value": value}
+    return {"kind": "json", "type": type(value).__name__, "value": display_value}
+
+
+def _sanitize_json(value: object, _seen: frozenset[int] | None = None) -> Any:
+    """Replace non-finite floats with their names so the value stays JSON-safe."""
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, dict):
+        seen = _seen or frozenset()
+        if id(value) in seen:
+            raise TypeError("Circular reference cannot cross the notebook bridge")
+        seen = seen | {id(value)}
+        return {
+            _sanitize_json(key, seen): _sanitize_json(item, seen)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        seen = _seen or frozenset()
+        if id(value) in seen:
+            raise TypeError("Circular reference cannot cross the notebook bridge")
+        seen = seen | {id(value)}
+        return [_sanitize_json(item, seen) for item in value]
+    return value
 
 
 def _media_displays(displays: list[dict[str, object]]) -> AbstractContextManager[None]:

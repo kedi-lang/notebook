@@ -211,3 +211,72 @@ def _chunked_json(payload: dict):
     body = json.dumps(payload).encode()
     for index in range(0, len(body), 65_536):
         yield body[index : index + 65_536]
+
+
+def test_json_result_shows_non_finite_floats_as_text() -> None:
+    from kedi_notebook.runtime import _json_result
+
+    assert _json_result(float("nan")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "NaN",
+    }
+    assert _json_result(float("inf")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "Infinity",
+    }
+    assert _json_result(float("-inf")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "-Infinity",
+    }
+    assert _json_result({"value": float("nan"), "items": [float("inf")]}) == {
+        "kind": "json",
+        "type": "dict",
+        "value": {"value": "NaN", "items": ["Infinity"]},
+    }
+    assert _json_result(1.5) == {"kind": "json", "type": "float", "value": 1.5}
+
+
+def test_execute_cell_returns_nan_result_instead_of_failing(
+    tmp_path: Path,
+) -> None:
+    from kedi_notebook.runtime import _json_result
+
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+    manager = app.state.notebook_manager
+
+    class StubSession:
+        id = "stub-nan"
+
+        def touch(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def execute(self, *, cell_id, source):
+            return {
+                "ok": True,
+                "cellId": cell_id,
+                "attempt": 1,
+                "result": _json_result(float("nan")),
+            }
+
+    manager._sessions["stub-nan"] = StubSession()
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/notebook/sessions/stub-nan/cells/execute",
+            json={"cellId": "c1", "source": "1.0/0.0"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == {
+        "kind": "json",
+        "type": "float",
+        "value": "NaN",
+    }
