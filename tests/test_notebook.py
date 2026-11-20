@@ -1408,3 +1408,129 @@ def test_media_results_without_kedi_media_fall_back_to_json(
 
     monkeypatch.setattr(builtins, "__import__", missing_media)
     assert notebook_runtime._json_result([1]) == {"kind": "json", "type": "list", "value": [1]}
+
+
+# Audit #215 item 1: process-control names must never become server secrets.
+BLOCKED_PROCESS_CONTROL_NAMES = [
+    "PATH",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "PYTHONBREAKPOINT",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "UV_INDEX_URL",
+    "UV_PYTHON",
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "VIRTUAL_ENV",
+    "HOME",
+    "SHELL",
+    "BASH_ENV",
+    "ENV",
+]
+
+
+@pytest.mark.parametrize("name", BLOCKED_PROCESS_CONTROL_NAMES)
+def test_notebook_secret_api_rejects_process_control_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    monkeypatch.delenv(name, raising=False)
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.put(
+            "/api/notebook/secrets",
+            json={"name": name, "value": "injected"},
+        )
+
+    assert response.status_code == 400
+    assert name in response.json()["error"]
+    assert "controls the notebook process" in response.json()["error"]
+    assert name not in os.environ
+    assert app.state.notebook_secret_store.names == ()
+
+
+def test_notebook_secret_api_still_accepts_provider_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.put(
+            "/api/notebook/secrets",
+            json={"name": "OPENAI_API_KEY", "value": "not-a-real-key"},
+        )
+
+    assert response.status_code == 200
+    assert os.environ["OPENAI_API_KEY"] == "not-a-real-key"
+
+
+def test_notebook_secret_api_import_dotenv_rejects_process_control_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    (tmp_path / "import.env").write_text(
+        "PYTHONPATH=/tmp/evil\nOPENAI_API_KEY=not-a-real-key\n",
+        encoding="utf-8",
+    )
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "import.env"},
+        )
+
+    assert response.status_code == 400
+    assert "PYTHONPATH" in response.json()["error"]
+    assert "PYTHONPATH" not in os.environ
+    # The import is atomic: a blocked name rejects the whole file.
+    assert app.state.notebook_secret_store.names == ()
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_notebook_secret_store_drops_process_control_names_on_disk_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    path = tmp_path / "secrets.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "secrets": {
+                    "PYTHONPATH": "/tmp/evil",
+                    "OPENAI_API_KEY": "not-a-real-key",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = NotebookSecretStore(path)
+    store.apply_to_environment()
+
+    assert store.names == ("OPENAI_API_KEY",)
+    assert "PYTHONPATH" not in os.environ
+    assert os.environ["OPENAI_API_KEY"] == "not-a-real-key"

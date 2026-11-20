@@ -14,6 +14,29 @@ _MAX_FILE_BYTES: Final = 1_000_000
 _MAX_SECRETS: Final = 256
 _MAX_VALUE_CHARS: Final = 128_000
 
+# Names that control the notebook process itself (interpreter, loader, package
+# tools, shell). Storing one as a secret would inject it into the server's
+# os.environ and from there into every worker and bootstrap command, so these
+# are rejected on write and dropped when an older store is loaded.
+_PROCESS_CONTROL_NAMES: Final = frozenset(
+    {
+        "PATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "VIRTUAL_ENV",
+        "HOME",
+        "SHELL",
+        "BASH_ENV",
+        "ENV",
+    }
+)
+_PROCESS_CONTROL_PREFIXES: Final = ("PYTHON", "LD_", "DYLD_", "UV_", "PIP_")
+
+
+def is_process_control_name(name: str) -> bool:
+    """Whether ``name`` controls the notebook process and must never be a secret."""
+    return name in _PROCESS_CONTROL_NAMES or name.startswith(_PROCESS_CONTROL_PREFIXES)
+
 
 class NotebookSecretStore:
     """Persist notebook environment values without exposing them to the browser."""
@@ -45,6 +68,7 @@ class NotebookSecretStore:
             raise ValueError("No environment values were provided")
         for name, value in values.items():
             _validate_name(name)
+            _validate_not_process_control(name)
             _validate_value(value)
         updated = dict(self._values)
         updated.update(values)
@@ -95,6 +119,10 @@ class NotebookSecretStore:
         for name, value in raw_values.items():
             if not isinstance(name, str) or not isinstance(value, str):
                 raise RuntimeError("Notebook secret store has invalid entries")
+            if is_process_control_name(name):
+                # Written before process-control names were blocked: forget it
+                # instead of injecting it into the server environment again.
+                continue
             try:
                 _validate_name(name)
                 _validate_value(value)
@@ -138,6 +166,14 @@ class NotebookSecretStore:
 def _validate_name(name: str) -> None:
     if not _ENVIRONMENT_NAME.fullmatch(name):
         raise ValueError("Environment name must be a valid identifier")
+
+
+def _validate_not_process_control(name: str) -> None:
+    if is_process_control_name(name):
+        raise ValueError(
+            f"Environment name {name!r} controls the notebook process and "
+            "cannot be stored as a secret"
+        )
 
 
 def _validate_value(value: str) -> None:
