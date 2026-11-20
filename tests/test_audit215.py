@@ -148,3 +148,66 @@ def test_dotenv_import_rejects_paths_outside_cwd(tmp_path: Path) -> None:
     assert local.status_code == 200
     assert local.json()["imported"] == ["LOCAL_MARKER"]
     assert "LEAKED_MARKER" not in secret_store.names
+
+
+def _run_live_notebook_server(tmp_path: Path):
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started
+    return server, thread, f"http://127.0.0.1:{port}"
+
+
+def test_chunked_body_over_limit_gets_413(tmp_path: Path) -> None:
+    import json
+
+    import httpx
+
+    server, thread, base = _run_live_notebook_server(tmp_path)
+    try:
+        with httpx.Client(timeout=60, trust_env=False) as client:
+            oversized = client.post(
+                f"{base}/api/notebook/sessions",
+                content=_chunked_json({"mode": "browser", "pad": "B" * 10_000_000}),
+                headers={"Content-Type": "application/json"},
+            )
+            within_limit = client.post(
+                f"{base}/api/notebook/sessions",
+                content=_chunked_json({"mode": "browser"}),
+                headers={"Content-Type": "application/json"},
+            )
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+    assert oversized.status_code == 413
+    assert oversized.json()["error"] == "Request body is too large"
+    # A small chunked body still reaches the app (replay works).
+    assert within_limit.status_code == 200
+    assert within_limit.json()["mode"] == "browser"
+
+
+def _chunked_json(payload: dict):
+    """A chunked (no Content-Length) JSON request body."""
+    import json
+
+    body = json.dumps(payload).encode()
+    for index in range(0, len(body), 65_536):
+        yield body[index : index + 65_536]

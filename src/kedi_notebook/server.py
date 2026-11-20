@@ -21,6 +21,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.requests import ClientDisconnect
 
 from .host_environment import HostEnvironmentProvider
 from .pyright import PyrightServer
@@ -168,6 +169,11 @@ def create_app(
     async def local_browser_headers(request: Request, call_next: Any) -> Response:
         response: Response
         if request.url.path.startswith("/api/"):
+            limit = (
+                _MAX_RESTORE_REQUEST_BYTES
+                if request.url.path == "/api/notebook/sessions/restore"
+                else _MAX_REQUEST_BYTES
+            )
             if access_token is None and not _loopback_request_host(request):
                 response = JSONResponse(
                     {"ok": False, "error": "Forbidden: notebook API host is not loopback"},
@@ -183,14 +189,14 @@ def create_app(
                     {"ok": False, "error": "Unauthorized: notebook access token is required"},
                     status_code=401,
                 )
-            elif _request_too_large(
-                request,
-                limit=(
-                    _MAX_RESTORE_REQUEST_BYTES
-                    if request.url.path == "/api/notebook/sessions/restore"
-                    else _MAX_REQUEST_BYTES
-                ),
-            ):
+            elif _request_too_large(request, limit=limit):
+                response = JSONResponse(
+                    {"ok": False, "error": "Request body is too large"},
+                    status_code=413,
+                )
+            elif await _read_body_with_limit(request, limit=limit) is None:
+                # Content-Length is absent for chunked bodies, so the header
+                # check above cannot see them; count the bytes instead.
                 response = JSONResponse(
                     {"ok": False, "error": "Request body is too large"},
                     status_code=413,
@@ -831,6 +837,29 @@ def _request_too_large(request: Request, *, limit: int) -> bool:
         return int(content_length) > limit
     except ValueError:
         return True
+
+
+async def _read_body_with_limit(request: Request, *, limit: int) -> bytes | None:
+    """Read the request body, counting bytes; ``None`` when it exceeds ``limit``.
+
+    ``Content-Length`` is absent for chunked bodies, so the header check in
+    :func:`_request_too_large` cannot see them. The body is cached on the
+    request so the middleware replay hands the same bytes to the app instead
+    of an empty body.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > limit:
+                return None
+            chunks.append(chunk)
+    except ClientDisconnect:
+        return b""
+    body = b"".join(chunks)
+    request._body = body  # noqa: SLF001 - _CachedRequest replays _body downstream.
+    return body
 
 
 def _range_payload(range_: Any) -> dict[str, dict[str, int]]:
