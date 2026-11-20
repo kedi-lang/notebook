@@ -114,6 +114,25 @@ class KediTreeSitterHighlighter {
     this.resultId = null;
     this.revision = 0;
     this.snapshots = new Map();
+    this.disposed = false;
+  }
+
+  // WASM allocations (parsers, queries, trees) are not freed by the JS
+  // garbage collector; a highlighter must be disposed when its model is
+  // disposed or one set leaks per closed editor.
+  dispose() {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.tree?.delete();
+    this.tree = null;
+    this.snapshots.clear();
+    this.parser.delete();
+    this.pythonParser.delete();
+    this.query.delete();
+    this.pythonQuery.delete();
+    this.injectionQuery.delete();
   }
 
   provide(source, lastResultId) {
@@ -456,6 +475,7 @@ function pointAt(text, utf16Index) {
 
 export const testing = {
   encodeSemanticTokens,
+  KediTreeSitterHighlighter,
   minimalTreeEdit,
   tokenEdits,
 };

@@ -314,6 +314,13 @@ async function registerKediLanguage(monaco) {
       if (!highlighterPromise) {
         highlighterPromise = createKediTreeSitterHighlighter();
         highlighters.set(model, highlighterPromise);
+        // The highlighter owns WASM allocations the garbage collector
+        // cannot free; dispose them with the model instead of leaking one
+        // set of parsers, queries and trees per closed editor.
+        model.onDidDispose(() => {
+          highlighters.delete(model);
+          void highlighterPromise.then((highlighter) => highlighter.dispose());
+        });
       }
       const highlighter = await highlighterPromise;
       if (

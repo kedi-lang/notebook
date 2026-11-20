@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
+import { testing } from "../src/kedi_notebook/static/tree-sitter-highlighter.js";
+
 // Audit #215 item 4: browser output over 64 KB killed the session because
 // postOutput sent it in a single POST and the server rejects texts over
 // 64_000 chars. notebook.js now splits output with chunkBridgeOutput and
@@ -83,4 +85,62 @@ test("teardown runs on pagehide, not beforeunload", () => {
   const beforeunload = notebookSource.slice(beforeunloadStart, beforeunloadEnd + 5);
   assert.match(beforeunload, /state\.dirty/);
   assert.doesNotMatch(beforeunload, /DELETE/);
+});
+
+test("highlighter dispose frees parsers, queries, tree and snapshots", () => {
+  const deleted = [];
+  const stub = (name) => ({
+    delete() {
+      deleted.push(name);
+    },
+    setLanguage() {},
+  });
+  const tree = { delete: () => deleted.push("tree") };
+  const highlighter = new testing.KediTreeSitterHighlighter({
+    Parser: class {
+      constructor() {
+        this.deleted = false;
+      }
+      setLanguage() {}
+      delete() {
+        deleted.push("parser");
+      }
+    },
+    kediLanguage: {},
+    kediQuery: stub("kediQuery"),
+    pythonLanguage: {},
+    pythonQuery: stub("pythonQuery"),
+    injectionQuery: stub("injectionQuery"),
+  });
+  highlighter.tree = tree;
+  highlighter.snapshots.set("tree-sitter-kedi:1", new Uint32Array([1]));
+
+  highlighter.dispose();
+  assert.deepEqual(deleted.sort(), [
+    "injectionQuery",
+    "kediQuery",
+    "parser",
+    "parser",
+    "pythonQuery",
+    "tree",
+  ]);
+  assert.equal(highlighter.tree, null);
+  assert.equal(highlighter.snapshots.size, 0);
+
+  // Idempotent: a second dispose must not delete anything again.
+  highlighter.dispose();
+  assert.equal(deleted.length, 6);
+});
+
+test("editor disposes the per-model highlighter on model disposal", async () => {
+  const editorSource = await readFile(
+    new URL("../src/kedi_notebook/static/kedi-editor.js", import.meta.url),
+    "utf8",
+  );
+  const providerStart = editorSource.indexOf("provideDocumentSemanticTokens");
+  assert.notEqual(providerStart, -1, "semantic tokens provider not found");
+  const provider = editorSource.slice(providerStart, providerStart + 1200);
+  assert.match(provider, /model\.onDidDispose/);
+  assert.match(provider, /highlighter\.dispose\(\)/);
+  assert.match(provider, /highlighters\.delete\(model\)/);
 });
