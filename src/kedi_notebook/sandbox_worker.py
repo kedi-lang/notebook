@@ -3,9 +3,11 @@ from __future__ import annotations
 import builtins
 import contextlib
 import io
+import itertools
 import json
 import os
 import sys
+import tokenize
 import traceback
 import types
 import typing
@@ -40,7 +42,11 @@ def _protocol_fd() -> int:
 
 
 _PROTOCOL_FD = _protocol_fd()
+# Opaque references to values that cannot cross the bridge, oldest first.
+# The registry is bounded: an evicted handle simply stops resolving.
 _OBJECT_REGISTRY: dict[str, Any] = {}
+_MAX_OBJECT_REGISTRY = 1024
+_REGISTRY_COUNTER = itertools.count(1)
 # The bridge protocol keeps the process streams while user output is redirected.
 _PROTOCOL_IN = sys.stdin
 _PROTOCOL_OUT = sys.stdout
@@ -122,9 +128,17 @@ def _from_json(value: Any) -> Any:
     return value
 
 
-def _to_json(value: Any) -> Any:
+_MAX_JSON_DEPTH = 100
+
+
+def _to_json(value: Any, _seen: frozenset[int] | None = None, _depth: int = 0) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if _depth > _MAX_JSON_DEPTH:
+        raise TypeError(
+            f"Python value {type(value).__name__} is nested too deeply "
+            "to cross the sandbox bridge"
+        )
     if isinstance(value, _KediProcedure):
         return {_PROCEDURE_KEY: value.__name__}
     # A media value exists only once kedi.media is imported; never import Kedi here otherwise.
@@ -136,11 +150,36 @@ def _to_json(value: Any) -> Any:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("Sandbox mappings require string keys")
-        return {key: _to_json(item) for key, item in value.items()}
+        seen = _seen or frozenset()
+        if id(value) in seen:
+            raise TypeError(
+                f"Python value {type(value).__name__} is circular and "
+                "cannot cross the sandbox bridge"
+            )
+        seen = seen | {id(value)}
+        return {key: _to_json(item, seen, _depth + 1) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_to_json(item) for item in value]
+        seen = _seen or frozenset()
+        if id(value) in seen:
+            raise TypeError(
+                f"Python value {type(value).__name__} is circular and "
+                "cannot cross the sandbox bridge"
+            )
+        seen = seen | {id(value)}
+        return [_to_json(item, seen, _depth + 1) for item in value]
     if hasattr(value, "__dict__") and not isinstance(value, (type, types.ModuleType)):
-        return {key: _to_json(item) for key, item in vars(value).items() if not key.startswith("_")}
+        seen = _seen or frozenset()
+        if id(value) in seen:
+            raise TypeError(
+                f"Python value {type(value).__name__} is circular and "
+                "cannot cross the sandbox bridge"
+            )
+        seen = seen | {id(value)}
+        return {
+            key: _to_json(item, seen, _depth + 1)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
     raise TypeError(f"Python value {type(value).__name__} cannot cross the sandbox bridge")
 
 
@@ -193,11 +232,39 @@ def _type_descriptor(value: Any) -> dict[str, Any]:
     raise TypeError("Python-defined types cannot cross the sandbox bridge yet")
 
 
+def _indent_block_lines(code: str) -> list[str]:
+    """Indent ``code`` for the wrapper function without touching string contents.
+
+    Lines strictly inside a multi-line string literal keep their text: adding
+    spaces there would change the string's value.
+    """
+    lines = code.splitlines()
+    string_rows: set[int] = set()
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(code).readline)
+        for token in tokens:
+            if token.type == tokenize.STRING:
+                start_row, end_row = token.start[0], token.end[0]
+                if end_row > start_row:
+                    # Every line after the opening line up to and including
+                    # the closing line: leading spaces there are string
+                    # content, and the line never needs indenting because it
+                    # continues the statement the string opened.
+                    string_rows.update(range(start_row + 1, end_row + 1))
+    except (tokenize.TokenError, SyntaxError):
+        # Unparseable code: indent everything and let compile() report it.
+        string_rows = set()
+    return [
+        f"    {line}" if index + 1 not in string_rows else line
+        for index, line in enumerate(lines)
+    ]
+
+
 def _run_block(namespace: dict[str, Any], code: str, sync_names: list[str]) -> Any:
     header = ["def __kedi_wrapper__():"]
     if sync_names:
         header.append(f"    global {', '.join(sync_names)}")
-    body = [f"    {line}" for line in code.splitlines()]
+    body = _indent_block_lines(code)
     source = "\n".join(header + body + ["    pass"])
     exec(compile(source, "<kedi-sandbox:block>", "exec"), namespace, namespace)
     wrapper = namespace.pop("__kedi_wrapper__")
@@ -218,8 +285,10 @@ def _serializable_namespace(
         try:
             encoded = _to_json(value)
         except TypeError:
-            handle = str(id(value))
+            handle = f"ref-{next(_REGISTRY_COUNTER)}"
             _OBJECT_REGISTRY[handle] = value
+            while len(_OBJECT_REGISTRY) > _MAX_OBJECT_REGISTRY:
+                _OBJECT_REGISTRY.pop(next(iter(_OBJECT_REGISTRY)))
             encoded = {_REFERENCE_KEY: handle}
         if installed is None or name not in installed or installed[name] != encoded:
             result[name] = encoded

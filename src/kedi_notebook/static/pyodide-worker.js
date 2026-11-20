@@ -261,7 +261,9 @@ const DRIVER_SETUP = String.raw`
 import builtins
 import contextlib
 import io
+import itertools
 import json
+import tokenize
 import traceback
 import types
 import typing
@@ -273,6 +275,11 @@ from pydantic import BaseModel
 _REFERENCE_KEY = "__kedi_notebook_ref__"
 _PROCEDURE_KEY = "__kedi_playground_procedure__"
 _OBJECT_REGISTRY = globals().setdefault("__kedi_object_registry", {})
+# Opaque references to values that cannot cross the bridge, oldest first.
+# The registry is bounded: an evicted handle simply stops resolving.
+_MAX_OBJECT_REGISTRY = 1024
+_REGISTRY_COUNTER = itertools.count(1)
+_MAX_JSON_DEPTH = 100
 # Output captured by each request being handled; nested requests stack on top.
 _CAPTURES = []
 # Requests whose Python may write Kedi bindings: only changed values are sent back.
@@ -332,9 +339,14 @@ class _KediOutput(io.StringIO):
         return written
 
 
-def _to_json(value):
+def _to_json(value, _seen=None, _depth=0):
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if _depth > _MAX_JSON_DEPTH:
+        raise TypeError(
+            f"Python value {type(value).__name__} is nested too deeply "
+            "to cross the notebook bridge"
+        )
     if isinstance(value, _KediProcedure):
         return {_PROCEDURE_KEY: value.__name__}
     if callable(value):
@@ -342,12 +354,33 @@ def _to_json(value):
     if isinstance(value, dict):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("Playground mappings require string keys")
-        return {key: _to_json(item) for key, item in value.items()}
+        seen = _seen or frozenset()
+        if id(value) in seen:
+            raise TypeError(
+                f"Python value {type(value).__name__} is circular and "
+                "cannot cross the notebook bridge"
+            )
+        seen = seen | {id(value)}
+        return {key: _to_json(item, seen, _depth + 1) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_to_json(item) for item in value]
+        seen = _seen or frozenset()
+        if id(value) in seen:
+            raise TypeError(
+                f"Python value {type(value).__name__} is circular and "
+                "cannot cross the notebook bridge"
+            )
+        seen = seen | {id(value)}
+        return [_to_json(item, seen, _depth + 1) for item in value]
     if hasattr(value, "__dict__") and not isinstance(value, (type, types.ModuleType)):
+        seen = _seen or frozenset()
+        if id(value) in seen:
+            raise TypeError(
+                f"Python value {type(value).__name__} is circular and "
+                "cannot cross the notebook bridge"
+            )
+        seen = seen | {id(value)}
         return {
-            key: _to_json(item)
+            key: _to_json(item, seen, _depth + 1)
             for key, item in vars(value).items()
             if not key.startswith("_")
         }
@@ -402,11 +435,39 @@ def _type_descriptor(value):
     raise TypeError("Python-defined types cannot cross the notebook bridge yet")
 
 
+def _indent_block_lines(code):
+    """Indent code for the wrapper function without touching string contents.
+
+    Lines strictly inside a multi-line string literal keep their text: adding
+    spaces there would change the string's value.
+    """
+    lines = code.splitlines()
+    string_rows = set()
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(code).readline)
+        for token in tokens:
+            if token.type == tokenize.STRING:
+                start_row, end_row = token.start[0], token.end[0]
+                if end_row > start_row:
+                    # Every line after the opening line up to and including
+                    # the closing line: leading spaces there are string
+                    # content, and the line never needs indenting because it
+                    # continues the statement the string opened.
+                    string_rows.update(range(start_row + 1, end_row + 1))
+    except (tokenize.TokenError, SyntaxError):
+        # Unparseable code: indent everything and let compile() report it.
+        string_rows = set()
+    return [
+        f"    {line}" if index + 1 not in string_rows else line
+        for index, line in enumerate(lines)
+    ]
+
+
 def _run_block(namespace, code, sync_names):
     header = ["def __kedi_wrapper__():"]
     if sync_names:
         header.append(f"    global {', '.join(sync_names)}")
-    body = [f"    {line}" for line in code.splitlines()]
+    body = _indent_block_lines(code)
     source = "\n".join(header + body + ["    pass"])
     exec(compile(source, "<kedi-pyodide:block>", "exec"), namespace, namespace)
     wrapper = namespace.pop("__kedi_wrapper__")
@@ -423,8 +484,10 @@ def _serializable_namespace(namespace, names, installed=None):
         try:
             encoded = _to_json(value)
         except TypeError:
-            handle = str(id(value))
+            handle = f"ref-{next(_REGISTRY_COUNTER)}"
             _OBJECT_REGISTRY[handle] = value
+            while len(_OBJECT_REGISTRY) > _MAX_OBJECT_REGISTRY:
+                _OBJECT_REGISTRY.pop(next(iter(_OBJECT_REGISTRY)))
             encoded = {_REFERENCE_KEY: handle}
         if installed is None or name not in installed or installed[name] != encoded:
             result[name] = encoded

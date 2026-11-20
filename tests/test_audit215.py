@@ -386,3 +386,132 @@ def test_stream_host_process_releases_threads_and_fds(tmp_path: Path) -> None:
     time.sleep(2)
     assert _live_thread_idents() <= threads_before
     assert _open_fd_count() <= fds_before
+
+
+def test_sandbox_worker_keeps_multiline_string_values_intact() -> None:
+    from kedi_notebook import sandbox_worker as worker
+
+    response = worker.handle_request(
+        {
+            "action": "execute_block",
+            "code": 'x = """\nalpha\nbeta\n"""',
+            "syncNames": ["x"],
+            "env": {},
+        }
+    )
+    assert response["ok"] is True
+    assert response["env"]["x"] == "\nalpha\nbeta\n"
+
+
+def test_sandbox_worker_turns_cyclic_values_into_references() -> None:
+    from kedi_notebook import sandbox_worker as worker
+
+    response = worker.handle_request(
+        {
+            "action": "execute_block",
+            "code": "x = {}\nx['self'] = x",
+            "syncNames": ["x"],
+            "env": {},
+        }
+    )
+    assert response["ok"] is True
+    encoded = response["env"]["x"]
+    assert set(encoded) == {"__kedi_notebook_ref__"}
+    assert worker._from_json(encoded) is worker._OBJECT_REGISTRY[encoded["__kedi_notebook_ref__"]]
+
+
+def test_sandbox_worker_object_registry_is_bounded() -> None:
+    from kedi_notebook import sandbox_worker as worker
+
+    first = worker.handle_request(
+        {
+            "action": "execute_block",
+            "code": "v0 = lambda: 0",
+            "syncNames": ["v0"],
+            "env": {},
+        }
+    )
+    first_handle = first["env"]["v0"]["__kedi_notebook_ref__"]
+    for index in range(1, 1_100):
+        worker.handle_request(
+            {
+                "action": "execute_block",
+                "code": f"v{index} = lambda: {index}",
+                "syncNames": [f"v{index}"],
+                "env": {},
+            }
+        )
+    assert len(worker._OBJECT_REGISTRY) <= worker._MAX_OBJECT_REGISTRY
+    assert first_handle not in worker._OBJECT_REGISTRY
+
+
+def _pyodide_driver_namespace() -> dict:
+    """Execute the DRIVER_SETUP Python shipped in pyodide-worker.js.
+
+    The ``js`` module it imports from is stubbed; the driver code itself is
+    the exact text from the shipped file.
+    """
+    import re
+    import sys
+    import types
+
+    static_root = Path(__file__).parent.parent / "src" / "kedi_notebook" / "static"
+    source = (static_root / "pyodide-worker.js").read_text(encoding="utf-8")
+    match = re.search(r"const DRIVER_SETUP = String\.raw`(.*?)`;\n", source, re.S)
+    assert match is not None, "DRIVER_SETUP not found in pyodide-worker.js"
+    js_module = types.ModuleType("js")
+    js_module.kediExchange = lambda message: "{}"
+    js_module.kediStreamOutput = lambda stream, text: None
+    sys.modules["js"] = js_module
+    namespace: dict = {}
+    exec(compile(match.group(1), "<pyodide-driver>", "exec"), namespace)
+    return namespace
+
+
+def test_pyodide_driver_setup_matches_sandbox_worker_fixes() -> None:
+    driver = _pyodide_driver_namespace()
+    handle = driver["_handle_kedi_request"]
+
+    multiline = handle(
+        {
+            "action": "execute_block",
+            "code": 'x = """\nalpha\nbeta\n"""',
+            "syncNames": ["x"],
+            "env": {},
+        }
+    )
+    assert multiline["ok"] is True
+    assert multiline["env"]["x"] == "\nalpha\nbeta\n"
+
+    cyclic = handle(
+        {
+            "action": "execute_block",
+            "code": "x = {}\nx['self'] = x",
+            "syncNames": ["x"],
+            "env": {},
+        }
+    )
+    assert cyclic["ok"] is True
+    assert set(cyclic["env"]["x"]) == {"__kedi_notebook_ref__"}
+
+    registry = driver["_OBJECT_REGISTRY"]
+    first = handle(
+        {
+            "action": "execute_block",
+            "code": "v0 = lambda: 0",
+            "syncNames": ["v0"],
+            "env": {},
+        }
+    )
+    first_handle = first["env"]["v0"]["__kedi_notebook_ref__"]
+    for index in range(1, 1_100):
+        handle(
+            {
+                "action": "execute_block",
+                "code": f"v{index} = lambda: {index}",
+                "syncNames": [f"v{index}"],
+                "env": {},
+            }
+        )
+    assert len(registry) <= driver["_MAX_OBJECT_REGISTRY"]
+    assert first_handle not in registry
