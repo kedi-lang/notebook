@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import asdict, dataclass
@@ -332,7 +332,7 @@ class NotebookSession:
         *,
         cell_id: str,
         source: str,
-    ) -> Iterator[dict[str, Any]]:
+    ) -> Generator[dict[str, Any], None, None]:
         with self._execution_lock:
             self._assert_open()
             self.touch()
@@ -478,7 +478,9 @@ class NotebookSession:
             ]
             return sorted(packages, key=lambda item: item["name"].lower())
 
-    def stream_package_install(self, packages: Sequence[str]) -> Iterator[dict[str, Any]]:
+    def stream_package_install(
+        self, packages: Sequence[str]
+    ) -> Generator[dict[str, Any], None, None]:
         if self.mode != "host" or self.python is None:
             raise ValueError("Package management requires a host Python runtime")
         with self._execution_lock:

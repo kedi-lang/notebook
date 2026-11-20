@@ -2139,3 +2139,75 @@ def test_browser_terminal_install_output_appears_once(tmp_path: Path) -> None:
     combined = "".join(event["text"] for event in outputs)
     assert combined == "Installing foo...\nInstalled foo in the browser runtime.\n"
     assert combined.count("Installed foo in the browser runtime.\n") == 1
+
+
+# Audit #215 item 14: closing a terminal stream mid-way (as a disconnect
+# does) must still apply a runtimeReset the client never read, instead of
+# leaking the session. The HTTP layer cannot be used for this: in this stack
+# (uvicorn 0.54 + Starlette 1.6.0) a disconnect only stops the stream from
+# being pulled and the generator is closed when the stream ends, so the
+# observable behaviour is the generator's close path, tested here directly.
+def test_notebook_terminal_stream_close_applies_runtime_reset(tmp_path: Path) -> None:
+    from kedi_notebook.server import _terminal_events
+
+    app = create_app(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    manager = app.state.notebook_manager
+    session = manager.create(mode="host")
+
+    def fake_stream_terminal(*args: Any, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield {"type": "output", "stream": "stdout", "text": "hello\n"}
+        # Starlette pulls the next chunk before noticing the disconnect, so
+        # this reset is observed even though the client never reads it.
+        yield {
+            "type": "result",
+            "ok": False,
+            "runtimeReset": True,
+            "error": "TimeoutExpired: command timed out",
+        }
+        yield {"type": "output", "stream": "stdout", "text": "more\n"}
+
+    session.stream_terminal = fake_stream_terminal  # type: ignore[method-assign]
+    events = _terminal_events(manager, session, session.id, cell_id="t1", source="!sleep 30")
+    assert "hello" in next(events)
+    assert "runtimeReset" in next(events)
+    events.close()  # The disconnect closes the response generator.
+
+    with pytest.raises(KeyError):
+        manager.get(session.id)
+
+
+def test_notebook_terminal_stream_close_without_reset_keeps_session(
+    tmp_path: Path,
+) -> None:
+    from kedi_notebook.server import _terminal_events
+
+    app = create_app(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    manager = app.state.notebook_manager
+    session = manager.create(mode="host")
+
+    def fake_stream_terminal(*args: Any, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield {"type": "output", "stream": "stdout", "text": "hello\n"}
+        yield {"type": "output", "stream": "stdout", "text": "more\n"}
+
+    session.stream_terminal = fake_stream_terminal  # type: ignore[method-assign]
+    events = _terminal_events(manager, session, session.id, cell_id="t1", source="!echo hi")
+    assert "hello" in next(events)
+    events.close()
+
+    assert manager.get(session.id) is session
+    manager.close(session.id)
+
+
+def test_notebook_bridge_manager_is_gone() -> None:
+    import kedi_notebook.bridge as bridge_module
+
+    assert not hasattr(bridge_module, "BridgeManager")
+    assert "BridgeManager" not in bridge_module.__all__

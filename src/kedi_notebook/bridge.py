@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from collections.abc import Iterator, Mapping
-from threading import Condition, Lock
+from threading import Condition
 from typing import Any
 from uuid import uuid4
 
@@ -140,32 +140,4 @@ class BridgeRun:
             raise RuntimeError("Playground bridge run is already complete")
 
 
-class BridgeManager:
-    def __init__(self) -> None:
-        self._runs: dict[str, BridgeRun] = {}
-        self._lock = Lock()
-
-    def get_or_create(self, run_id: str) -> BridgeRun:
-        with self._lock:
-            run = self._runs.get(run_id)
-            if run is None:
-                run = BridgeRun(run_id)
-                self._runs[run_id] = run
-            return run
-
-    def cancel(self, run_id: str) -> None:
-        self.get_or_create(run_id).cancel()
-
-    def cleanup(self, *, max_age: float = 600) -> None:
-        cutoff = time.monotonic() - max_age
-        with self._lock:
-            stale = [
-                run_id
-                for run_id, run in self._runs.items()
-                if run.updated_at < cutoff and (run.done or run.cancelled)
-            ]
-            for run_id in stale:
-                del self._runs[run_id]
-
-
-__all__ = ["BridgeCancelled", "BridgeManager", "BridgeRun"]
+__all__ = ["BridgeCancelled", "BridgeRun"]

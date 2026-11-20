@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .host_environment import HostEnvironmentProvider
 from .pyright import PyrightServer
-from .runtime import NotebookSessionManager
+from .runtime import NotebookSession, NotebookSessionManager
 from .secrets import NotebookSecretStore
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -381,19 +381,14 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - API boundary.
             return _error_response(exc)
 
-        def events() -> Iterator[str]:
-            runtime_reset = False
-            for event in session.stream_terminal(
+        return StreamingResponse(
+            _terminal_events(
+                manager,
+                session,
+                session_id,
                 cell_id=payload.cell_id,
                 source=payload.source,
-            ):
-                runtime_reset = runtime_reset or event.get("runtimeReset") is True
-                yield json.dumps(event, separators=(",", ":")) + "\n"
-            if runtime_reset:
-                manager.close(session_id)
-
-        return StreamingResponse(
-            events(),
+            ),
             media_type="application/x-ndjson",
             headers={"X-Content-Type-Options": "nosniff"},
         )
@@ -464,12 +459,8 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - API boundary.
             return _error_response(exc)
 
-        def events() -> Iterator[str]:
-            for event in session.stream_package_install(payload.packages):
-                yield json.dumps(event, separators=(",", ":")) + "\n"
-
         return StreamingResponse(
-            events(),
+            _package_install_events(manager, session, session_id, packages=payload.packages),
             media_type="application/x-ndjson",
             headers={"X-Content-Type-Options": "nosniff"},
         )
@@ -816,6 +807,52 @@ def _resolve_dotenv_path(raw_path: str, *, cwd: Path) -> Path:
     if resolved.stat().st_size > _MAX_DOTENV_BYTES:
         raise ValueError("The selected .env file is larger than 1 MB")
     return resolved
+
+
+def _terminal_events(
+    manager: NotebookSessionManager,
+    session: NotebookSession,
+    session_id: str,
+    *,
+    cell_id: str,
+    source: str,
+) -> Iterator[str]:
+    runtime_reset = False
+    iterator = iter(session.stream_terminal(cell_id=cell_id, source=source))
+    try:
+        for event in iterator:
+            runtime_reset = runtime_reset or event.get("runtimeReset") is True
+            yield json.dumps(event, separators=(",", ":")) + "\n"
+    finally:
+        # A disconnect closes this generator: stop the terminal stream
+        # (releasing the execution lock and terminating the process) instead
+        # of leaving it running, and still apply the runtime reset the
+        # client never read.
+        iterator.close()
+        if runtime_reset:
+            manager.close(session_id)
+
+
+def _package_install_events(
+    manager: NotebookSessionManager,
+    session: NotebookSession,
+    session_id: str,
+    *,
+    packages: Sequence[str],
+) -> Iterator[str]:
+    runtime_reset = False
+    iterator = iter(session.stream_package_install(packages))
+    try:
+        for event in iterator:
+            runtime_reset = runtime_reset or event.get("runtimeReset") is True
+            yield json.dumps(event, separators=(",", ":")) + "\n"
+    finally:
+        # A disconnect closes this generator: stop the install stream
+        # (releasing the execution lock and terminating pip) instead of
+        # leaving it running.
+        iterator.close()
+        if runtime_reset:
+            manager.close(session_id)
 
 
 def _error_response(exc: BaseException) -> JSONResponse:
