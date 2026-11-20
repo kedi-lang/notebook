@@ -2211,3 +2211,36 @@ def test_notebook_bridge_manager_is_gone() -> None:
 
     assert not hasattr(bridge_module, "BridgeManager")
     assert "BridgeManager" not in bridge_module.__all__
+
+
+def _event_listener_body(source: str, event: str) -> str:
+    """Return the body of the first window.addEventListener(event, ...) handler."""
+    marker = f'window.addEventListener("{event}", '
+    start = source.index(marker) + len(marker)
+    body_start = source.index("{", start)
+    depth = 0
+    for index in range(body_start, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[body_start + 1 : index]
+    raise AssertionError(f"unbalanced braces in {event} handler")
+
+
+# Audit #215 item 5: leaving the page must not delete the session when the
+# user stays; the cleanup belongs on pagehide, not beforeunload.
+def test_notebook_pagehide_deletes_session_and_beforeunload_only_warns() -> None:
+    source = Path("src/kedi_notebook/static/notebook/notebook.js").read_text(encoding="utf-8")
+    pagehide = _event_listener_body(source, "pagehide")
+    assert "persistDraft()" in pagehide
+    assert 'method: "DELETE"' in pagehide
+    assert "browserBridge?.stop()" in pagehide
+    assert "browserRuntime?.dispose()" in pagehide
+
+    beforeunload = _event_listener_body(source, "beforeunload")
+    assert "returnValue" in beforeunload
+    assert "DELETE" not in beforeunload
+    assert "browserBridge" not in beforeunload
+    assert "browserRuntime" not in beforeunload

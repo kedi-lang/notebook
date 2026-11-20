@@ -151,7 +151,11 @@ function bindEvents() {
   ui.saveJustNotebook.addEventListener("click", () => void saveNotebook("notebook"));
   ui.openNotebook.addEventListener("click", () => ui.notebookFile.click());
   ui.notebookFile.addEventListener("change", () => void openNotebookFile());
-  window.addEventListener("beforeunload", () => {
+  // pagehide, not beforeunload: beforeunload also fires when the user is
+  // asked about unsaved changes and decides to stay, which deleted the
+  // session out from under a page that was still in use. pagehide only
+  // fires when the page is actually going away.
+  window.addEventListener("pagehide", () => {
     persistDraft();
     if (state.sessionId) {
       void apiFetch(`/api/notebook/sessions/${state.sessionId}`, {
