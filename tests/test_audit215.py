@@ -783,11 +783,23 @@ def test_terminal_pipes_run_through_the_shell(tmp_path: Path) -> None:
     assert seen_argv[2] == ["/bin/sh", "-lc", "echo hi"]
 
 
-def test_terminal_pipe_filters_output_end_to_end(tmp_path: Path) -> None:
+def test_terminal_pipe_filters_output_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import sys
 
     from kedi_notebook.host_environment import PreparedHostEnvironment
     from kedi_notebook.runtime import NotebookSessionManager
+
+    # A login shell (/bin/sh -lc) sources the developer's profile: on macOS
+    # /etc/profile runs path_helper and ~/.profile may print errors, and both
+    # leak into the captured stdout. Point HOME at an empty directory and
+    # clear the startup-file variables so the test sees only the command.
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    monkeypatch.setenv("HOME", str(empty_home))
+    monkeypatch.delenv("ENV", raising=False)
+    monkeypatch.delenv("BASH_ENV", raising=False)
 
     class _PassthroughHostEnvironment:
         def prepare(self, *, executable, version, cwd):
