@@ -374,14 +374,25 @@ def create_app(
 
         def events() -> Iterator[str]:
             runtime_reset = False
-            for event in session.stream_terminal(
+            completed = False
+            stream = session.stream_terminal(
                 cell_id=payload.cell_id,
                 source=payload.source,
-            ):
-                runtime_reset = runtime_reset or event.get("runtimeReset") is True
-                yield json.dumps(event, separators=(",", ":")) + "\n"
-            if runtime_reset:
-                manager.close(session_id)
+            )
+            try:
+                for event in stream:
+                    runtime_reset = runtime_reset or event.get("runtimeReset") is True
+                    yield json.dumps(event, separators=(",", ":")) + "\n"
+                completed = True
+            finally:
+                # A disconnect abandons the stream mid-flight; stop the
+                # terminal process and reset the session instead of leaving
+                # it alive until TTL cleanup.
+                try:
+                    stream.close()
+                finally:
+                    if runtime_reset or not completed:
+                        manager.close(session_id)
 
         return StreamingResponse(
             events(),
@@ -456,8 +467,14 @@ def create_app(
             return _error_response(exc)
 
         def events() -> Iterator[str]:
-            for event in session.stream_package_install(payload.packages):
-                yield json.dumps(event, separators=(",", ":")) + "\n"
+            stream = session.stream_package_install(payload.packages)
+            try:
+                for event in stream:
+                    yield json.dumps(event, separators=(",", ":")) + "\n"
+            finally:
+                # A disconnect stops the install instead of leaving pip
+                # running after the client is gone.
+                stream.close()
 
         return StreamingResponse(
             events(),

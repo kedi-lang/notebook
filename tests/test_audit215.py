@@ -149,14 +149,14 @@ def test_dotenv_import_rejects_paths_outside_cwd(tmp_path: Path) -> None:
     assert "LEAKED_MARKER" not in secret_store.names
 
 
-def _run_live_notebook_server(tmp_path: Path):
+def _run_live_notebook_server(tmp_path: Path, app=None):
     import socket
     import threading
     import time
 
     import uvicorn
 
-    app = create_app(
+    app = app or create_app(
         cwd=tmp_path,
         secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
     )
@@ -601,3 +601,100 @@ def test_secret_store_refuses_to_read_through_a_symlink(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="symbolic link"):
         NotebookSecretStore(link)
     assert victim.read_text(encoding="utf-8").startswith('{"version": 1')
+
+
+def _endpoint(app, path: str):
+    return next(route.endpoint for route in app.routes if route.path == path)
+
+
+def test_terminal_disconnect_closes_the_session(tmp_path: Path) -> None:
+    import asyncio
+
+    from kedi_notebook.server import ExecuteCellPayload
+
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+    manager = app.state.notebook_manager
+    closed: list[str] = []
+
+    class StubSession:
+        id = "stub-term"
+
+        def touch(self) -> None:
+            pass
+
+        def close(self) -> None:
+            closed.append(self.id)
+
+        def stream_terminal(self, *, cell_id, source):
+            yield {"type": "output", "stream": "stdout", "text": "chunk-1\n"}
+            yield {"type": "output", "stream": "stdout", "text": "chunk-2\n"}
+            yield {
+                "type": "result",
+                "ok": True,
+                "cellId": cell_id,
+                "attempt": 1,
+                "stdout": "",
+                "runtimeReset": True,
+            }
+
+    manager._sessions["stub-term"] = StubSession()
+    endpoint = _endpoint(app, "/api/notebook/sessions/{session_id}/terminal/execute")
+    response = endpoint("stub-term", ExecuteCellPayload(cellId="c1", source="!echo hi"))
+    stream = response.body_iterator
+    first = asyncio.run(stream.__anext__())
+    assert "chunk-1" in first
+    # A client disconnect closes the response stream mid-flight; the
+    # session must be reset instead of surviving until TTL cleanup.
+    asyncio.run(stream.aclose())
+
+    assert closed == ["stub-term"]
+    assert "stub-term" not in manager._sessions
+
+
+def test_package_install_disconnect_stops_the_stream(tmp_path: Path) -> None:
+    import asyncio
+
+    from kedi_notebook.server import PackageInstallPayload
+
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+    manager = app.state.notebook_manager
+    stream_closed: list[bool] = []
+
+    class StubSession:
+        id = "stub-install"
+
+        def touch(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def stream_package_install(self, packages):
+            try:
+                yield {"type": "output", "stream": "stdout", "text": "chunk-1\n"}
+                yield {"type": "result", "ok": True, "returnCode": 0, "error": None}
+            finally:
+                stream_closed.append(True)
+
+    manager._sessions["stub-install"] = StubSession()
+    endpoint = _endpoint(app, "/api/notebook/sessions/{session_id}/packages/install")
+    response = endpoint("stub-install", PackageInstallPayload(packages=["requests"]))
+    stream = response.body_iterator
+    first = asyncio.run(stream.__anext__())
+    assert "chunk-1" in first
+    asyncio.run(stream.aclose())
+
+    assert stream_closed == [True]
+
+
+def test_bridge_manager_is_removed() -> None:
+    from kedi_notebook import bridge
+
+    assert not hasattr(bridge, "BridgeManager")
+    assert "BridgeManager" not in bridge.__all__
