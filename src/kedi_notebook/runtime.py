@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,10 +18,10 @@ import time
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from secrets import token_hex
 from typing import Any, Final, Literal
 from uuid import uuid4
@@ -198,6 +199,30 @@ class HostPythonBridge:
     def _worker_error(self, fallback: str) -> str:
         detail = "\n".join(self._stderr).strip()
         return detail or fallback
+
+
+def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
+    """Terminate a host process and the children that inherited its pipes.
+
+    The process runs in its own process group (see ``_stream_host_process``),
+    so signalling the group also reaches backgrounded children; otherwise
+    they keep the output pipes open and outlive the session as zombies.
+    The group is signalled even when the main process already exited,
+    because a backgrounded child may still hold the pipes open.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (AttributeError, OSError):
+        if process.poll() is None:
+            process.terminate()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, OSError):
+            process.kill()
+        process.wait(timeout=1)
 
 
 class NotebookSession:
@@ -498,6 +523,11 @@ class NotebookSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            # A process group of its own, so a timeout can kill backgrounded
+            # children that inherited the output pipes too; otherwise a
+            # grandchild keeps the pipes open and the pump threads never see
+            # EOF.
+            start_new_session=True,
         )
         with self._state_lock:
             if self._closed:
@@ -505,18 +535,37 @@ class NotebookSession:
                 raise BridgeCancelled("Notebook session was interrupted")
             self._active_terminal_process = process
         output: Queue[tuple[str, str | None]] = Queue(maxsize=128)
+        stop = threading.Event()
+
+        def offer(item: tuple[str, str | None]) -> bool:
+            """Queue an output item unless the consumer has gone away."""
+            while True:
+                try:
+                    output.put(item, timeout=0.1)
+                    return True
+                except Full:
+                    if stop.is_set():
+                        return False
 
         def pump(stream_name: str, stream: Any) -> None:
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             try:
-                while chunk := os.read(stream.fileno(), 4096):
+                while True:
+                    try:
+                        chunk = os.read(stream.fileno(), 4096)
+                    except (OSError, ValueError):
+                        break
+                    if not chunk:
+                        break
                     if text := decoder.decode(chunk):
-                        output.put((stream_name, text))
+                        if not offer((stream_name, text)):
+                            return
                 if text := decoder.decode(b"", final=True):
-                    output.put((stream_name, text))
+                    offer((stream_name, text))
             finally:
-                stream.close()
-                output.put((stream_name, None))
+                with suppress(OSError, ValueError):
+                    stream.close()
+                offer((stream_name, None))
 
         if process.stdout is None or process.stderr is None:
             process.kill()
@@ -534,7 +583,7 @@ class NotebookSession:
             while open_streams:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    process.kill()
+                    _terminate_process_tree(process)
                     raise subprocess.TimeoutExpired(command, timeout)
                 try:
                     stream_name, text = output.get(timeout=min(remaining, 0.1))
@@ -547,16 +596,18 @@ class NotebookSession:
             return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
             yield {"type": "command_result", "returnCode": return_code}
         finally:
+            stop.set()
             with self._state_lock:
                 if self._active_terminal_process is process:
                     self._active_terminal_process = None
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=1)
+            _terminate_process_tree(process)
+            for reader in readers:
+                reader.join(timeout=2)
+            with suppress(OSError, ValueError):
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
 
     def _host_process_env(self) -> dict[str, str]:
         if self.python is None:
@@ -596,8 +647,8 @@ class NotebookSession:
             self.bridge.cancel()
         else:
             self.bridge.close()
-        if terminal_process is not None and terminal_process.poll() is None:
-            terminal_process.terminate()
+        if terminal_process is not None:
+            _terminate_process_tree(terminal_process)
         with self._execution_lock:
             self._session.close()
 

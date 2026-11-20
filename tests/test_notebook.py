@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -1741,3 +1742,84 @@ def test_host_worker_ignores_forged_fd1_protocol_replies(tmp_path: Path) -> None
     # The next request must get its own real response, not the forged one.
     assert after["ok"] is True
     assert after["stdout"] == "2\n"
+
+
+# Audit #215 item 9: a timed-out or abandoned host process must not leak pump
+# threads, pipe FDs or zombies.
+def _process_resources() -> tuple[set[threading.Thread], int]:
+    return set(threading.enumerate()), len(os.listdir("/proc/self/fd"))
+
+
+def _assert_resources_released(
+    before_threads: set[threading.Thread],
+    before_fds: int,
+    *,
+    timeout: float = 10,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        threads, fds = _process_resources()
+        if threads <= before_threads and fds <= before_fds:
+            return
+        time.sleep(0.05)
+    threads, fds = _process_resources()
+    assert threads <= before_threads, f"leaked threads: {threads - before_threads}"
+    assert fds <= before_fds, f"leaked FDs: {fds} > {before_fds}"
+
+
+def test_stream_host_process_timeout_reaps_grandchild_holding_pipe(
+    tmp_path: Path,
+) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        before_threads, before_fds = _process_resources()
+        started = time.monotonic()
+        events = session._stream_host_process(  # noqa: SLF001 - leak under test.
+            ["/bin/sh", "-lc", "sleep 30 & echo started"],
+            command="sleep 30 & echo started",
+            timeout=2,
+        )
+        with pytest.raises(subprocess.TimeoutExpired):
+            list(events)
+        # The timeout is 2s; cleanup must not wait out the 30s grandchild.
+        assert time.monotonic() - started < 15
+        _assert_resources_released(before_threads, before_fds)
+    finally:
+        manager.close_all()
+
+
+def test_stream_host_process_abandoned_generator_releases_threads_and_fds(
+    tmp_path: Path,
+) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        before_threads, before_fds = _process_resources()
+        events = session._stream_host_process(  # noqa: SLF001 - leak under test.
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "for i in range(100000): print('x' * 200)",
+            ],
+            command="fast producer",
+            timeout=30,
+        )
+        first = next(events)
+        assert first["type"] == "output"
+        # Let the fast producer fill the bounded output queue first, so the
+        # pumps are blocked in put() when the consumer goes away.
+        time.sleep(0.5)
+        events.close()  # Consumer goes away mid-stream.
+        _assert_resources_released(before_threads, before_fds)
+    finally:
+        manager.close_all()
