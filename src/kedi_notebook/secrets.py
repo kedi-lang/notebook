@@ -10,6 +10,23 @@ from pathlib import Path
 from typing import Final
 
 _ENVIRONMENT_NAME: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Names that steer the notebook process itself (interpreter, loader, package
+# installer, shell, home directory). Storing one as a "secret" would let a
+# notebook API call rewrite how the server and its worker processes start,
+# so they are rejected wherever a secret is accepted.
+_PROCESS_CONTROL_NAMES: Final = frozenset(
+    {
+        "PATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "VIRTUAL_ENV",
+        "HOME",
+        "SHELL",
+        "BASH_ENV",
+        "ENV",
+    }
+)
+_PROCESS_CONTROL_PREFIXES: Final = ("PYTHON", "LD_", "DYLD_", "UV_", "PIP_")
 _MAX_FILE_BYTES: Final = 1_000_000
 _MAX_SECRETS: Final = 256
 _MAX_VALUE_CHARS: Final = 128_000
@@ -138,6 +155,11 @@ class NotebookSecretStore:
 def _validate_name(name: str) -> None:
     if not _ENVIRONMENT_NAME.fullmatch(name):
         raise ValueError("Environment name must be a valid identifier")
+    if name in _PROCESS_CONTROL_NAMES or name.startswith(_PROCESS_CONTROL_PREFIXES):
+        raise ValueError(
+            f"Environment name {name!r} controls the notebook process and "
+            "cannot be stored as a secret"
+        )
 
 
 def _validate_value(value: str) -> None:
