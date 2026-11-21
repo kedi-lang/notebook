@@ -46,6 +46,13 @@ class _PassthroughHostEnvironment:
 _PASSTHROUGH_HOST_ENVIRONMENT = _PassthroughHostEnvironment()
 
 
+# Static assets ship inside the kedi_notebook package. Resolve them relative
+# to this file so the suite also runs from the kedi repo root, where CI
+# invokes it as `pytest notebook/tests`, instead of assuming cwd is the
+# notebook repo root.
+_STATIC_ROOT = Path(__file__).resolve().parent.parent / "src" / "kedi_notebook" / "static"
+
+
 @pytest.fixture(autouse=True)
 def _isolate_notebook_secret_store(
     tmp_path: Path,
@@ -1747,7 +1754,11 @@ def test_host_worker_ignores_forged_fd1_protocol_replies(tmp_path: Path) -> None
 # Audit #215 item 9: a timed-out or abandoned host process must not leak pump
 # threads, pipe FDs or zombies.
 def _process_resources() -> tuple[set[threading.Thread], int]:
-    return set(threading.enumerate()), len(os.listdir("/proc/self/fd"))
+    # /proc/self/fd is Linux-only; macOS exposes the same entries via /dev/fd.
+    for fd_dir in ("/proc/self/fd", "/dev/fd"):
+        if os.path.isdir(fd_dir):
+            return set(threading.enumerate()), len(os.listdir(fd_dir))
+    raise RuntimeError("no file-descriptor directory found")
 
 
 def _assert_resources_released(
@@ -1888,7 +1899,7 @@ def _load_pyodide_driver_namespace(monkeypatch: pytest.MonkeyPatch) -> dict[str,
     """Execute the Python DRIVER_SETUP shipped inside pyodide-worker.js."""
     import types as stdlib_types
 
-    source = Path("src/kedi_notebook/static/pyodide-worker.js").read_text(encoding="utf-8")
+    source = _STATIC_ROOT / "pyodide-worker.js".read_text(encoding="utf-8")
     marker = "const DRIVER_SETUP = String.raw`"
     start = source.index(marker) + len(marker)
     end = source.index("\n`;", start)
@@ -2046,7 +2057,7 @@ def _run_pyodide_terminal_driver(
     import textwrap
     import types as stdlib_types
 
-    source = Path("src/kedi_notebook/static/pyodide-worker.js").read_text(encoding="utf-8")
+    source = _STATIC_ROOT / "pyodide-worker.js".read_text(encoding="utf-8")
     marker = "const TERMINAL_DRIVER = String.raw`"
     start = source.index(marker) + len(marker)
     end = source.index("\n`;", start)
@@ -2232,7 +2243,7 @@ def _event_listener_body(source: str, event: str) -> str:
 # Audit #215 item 5: leaving the page must not delete the session when the
 # user stays; the cleanup belongs on pagehide, not beforeunload.
 def test_notebook_pagehide_deletes_session_and_beforeunload_only_warns() -> None:
-    source = Path("src/kedi_notebook/static/notebook/notebook.js").read_text(encoding="utf-8")
+    source = _STATIC_ROOT / "notebook" / "notebook.js".read_text(encoding="utf-8")
     pagehide = _event_listener_body(source, "pagehide")
     assert "persistDraft()" in pagehide
     assert 'method: "DELETE"' in pagehide
@@ -2347,7 +2358,19 @@ def test_notebook_session_create_close_all_race(
 
 # Audit #215 item 16: a pip/python command with shell syntax must run through
 # the shell instead of silently dropping the pipe.
-def test_notebook_host_terminal_pipes_through_shell(tmp_path: Path) -> None:
+def test_notebook_host_terminal_pipes_through_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A login shell (/bin/sh -lc) sources the developer's profile: on macOS
+    # /etc/profile runs path_helper and ~/.profile may print errors, and both
+    # leak into the captured stdout. Point HOME at an empty directory and
+    # clear the startup-file variables so the test sees only the command.
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    monkeypatch.setenv("HOME", str(empty_home))
+    monkeypatch.delenv("ENV", raising=False)
+    monkeypatch.delenv("BASH_ENV", raising=False)
+
     manager = NotebookSessionManager(
         cwd=tmp_path,
         explicit_pythons=[sys.executable],
@@ -2366,5 +2389,7 @@ def test_notebook_host_terminal_pipes_through_shell(tmp_path: Path) -> None:
 
     outputs = [event for event in events if event.get("type") == "output"]
     assert "".join(event["text"] for event in outputs) == "goodbye\n"
+    # No profile output may leak in before the command's own output.
+    assert outputs[-1]["text"] == "goodbye\n"
     result = [event for event in events if event.get("type") == "result"][0]
     assert result["ok"] is True
