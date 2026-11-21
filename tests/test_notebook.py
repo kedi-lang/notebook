@@ -1899,7 +1899,7 @@ def _load_pyodide_driver_namespace(monkeypatch: pytest.MonkeyPatch) -> dict[str,
     """Execute the Python DRIVER_SETUP shipped inside pyodide-worker.js."""
     import types as stdlib_types
 
-    source = _STATIC_ROOT / "pyodide-worker.js".read_text(encoding="utf-8")
+    source = (_STATIC_ROOT / "pyodide-worker.js").read_text(encoding="utf-8")
     marker = "const DRIVER_SETUP = String.raw`"
     start = source.index(marker) + len(marker)
     end = source.index("\n`;", start)
@@ -2057,7 +2057,7 @@ def _run_pyodide_terminal_driver(
     import textwrap
     import types as stdlib_types
 
-    source = _STATIC_ROOT / "pyodide-worker.js".read_text(encoding="utf-8")
+    source = (_STATIC_ROOT / "pyodide-worker.js").read_text(encoding="utf-8")
     marker = "const TERMINAL_DRIVER = String.raw`"
     start = source.index(marker) + len(marker)
     end = source.index("\n`;", start)
@@ -2243,7 +2243,7 @@ def _event_listener_body(source: str, event: str) -> str:
 # Audit #215 item 5: leaving the page must not delete the session when the
 # user stays; the cleanup belongs on pagehide, not beforeunload.
 def test_notebook_pagehide_deletes_session_and_beforeunload_only_warns() -> None:
-    source = _STATIC_ROOT / "notebook" / "notebook.js".read_text(encoding="utf-8")
+    source = (_STATIC_ROOT / "notebook" / "notebook.js").read_text(encoding="utf-8")
     pagehide = _event_listener_body(source, "pagehide")
     assert "persistDraft()" in pagehide
     assert 'method: "DELETE"' in pagehide
