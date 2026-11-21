@@ -3,6 +3,7 @@ import {
   createKediEditor,
   setKediExecutionDiagnostic,
 } from "/kedi-editor.js";
+import { splitOutputText } from "./output-chunks.js";
 
 const STORAGE_KEY = "kedi.notebook.draft.v1";
 const MAX_NOTEBOOK_BYTES = 5_000_000;
@@ -151,7 +152,11 @@ function bindEvents() {
   ui.saveJustNotebook.addEventListener("click", () => void saveNotebook("notebook"));
   ui.openNotebook.addEventListener("click", () => ui.notebookFile.click());
   ui.notebookFile.addEventListener("change", () => void openNotebookFile());
-  window.addEventListener("beforeunload", () => {
+  // pagehide, not beforeunload: beforeunload also fires when the user is
+  // asked about unsaved changes and decides to stay, which deleted the
+  // session out from under a page that was still in use. pagehide only
+  // fires when the page is actually going away.
+  window.addEventListener("pagehide", () => {
     persistDraft();
     if (state.sessionId) {
       void apiFetch(`/api/notebook/sessions/${state.sessionId}`, {
@@ -756,16 +761,21 @@ class BrowserSessionBridge {
         let outputPosts = Promise.resolve();
         const postOutput = (stream, text) => {
           const requestId = currentId;
-          outputPosts = outputPosts.then(() =>
-            fetchJson(
-              `/api/notebook/sessions/${this.sessionId}/bridge/output`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ requestId, stream, text }),
-              },
-            ),
-          );
+          // One bridge/output post accepts at most 64,000 characters, so
+          // split longer output into ordered chunks (the promise chain
+          // below keeps them in order).
+          for (const chunk of splitOutputText(text)) {
+            outputPosts = outputPosts.then(() =>
+              fetchJson(
+                `/api/notebook/sessions/${this.sessionId}/bridge/output`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ requestId, stream, text: chunk }),
+                },
+              ),
+            );
+          }
         };
         const postResponse = async (response) => {
           await outputPosts;

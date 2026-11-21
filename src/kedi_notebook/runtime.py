@@ -4,23 +4,26 @@ import base64
 import binascii
 import codecs
 import json
+import math
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from queue import Empty, Queue
-from typing import Any, Literal
+from queue import Empty, Full, Queue
+from secrets import token_hex
+from typing import Any, Final, Literal
 from uuid import uuid4
 
 import kedi
@@ -90,6 +93,10 @@ class HostPythonBridge:
         self._request_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._closed = False
+        # Every reply from the worker must carry this nonce. User code can
+        # write to fd 1, but it never sees the nonce, so a forged protocol
+        # line is ignored instead of being accepted as the next response.
+        self._nonce = token_hex(16)
         self._process = subprocess.Popen(
             [executable, "-u", str(_WORKER)],
             stdin=subprocess.PIPE,
@@ -115,16 +122,29 @@ class HostPythonBridge:
             stdout = process.stdout
             if process.poll() is not None:
                 raise RuntimeError(self._worker_error("Host Python worker exited"))
-            process.stdin.write(json.dumps(dict(payload), separators=(",", ":")) + "\n")
+            request_payload = {"nonce": self._nonce, **dict(payload)}
+            process.stdin.write(json.dumps(request_payload, separators=(",", ":")) + "\n")
             process.stdin.flush()
-            response_queue: Queue[tuple[str, str | BaseException | None]] = Queue(maxsize=1)
+            response_queue: Queue[tuple[str, dict[str, Any] | BaseException | None]] = Queue(
+                maxsize=1
+            )
 
             def read_response() -> None:
                 try:
                     for line in stdout:
-                        if line.startswith(_RESPONSE_PREFIX):
-                            response_queue.put(("response", line.removeprefix(_RESPONSE_PREFIX)))
-                            return
+                        if not line.startswith(_RESPONSE_PREFIX):
+                            continue
+                        try:
+                            candidate = json.loads(line.removeprefix(_RESPONSE_PREFIX))
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(candidate, dict) or candidate.get("nonce") != self._nonce:
+                            # A forged line written to fd 1 by user code, or a
+                            # malformed line: never a protocol reply.
+                            continue
+                        candidate.pop("nonce", None)
+                        response_queue.put(("response", candidate))
+                        return
                     response_queue.put(("closed", None))
                 except BaseException as exc:  # Worker pipe boundary.
                     response_queue.put(("error", exc))
@@ -147,10 +167,9 @@ class HostPythonBridge:
                 if interrupted:
                     raise BridgeCancelled("Host Python worker was interrupted")
                 raise RuntimeError(self._worker_error("Host Python worker returned no response"))
-            response = json.loads(str(value))
-            if not isinstance(response, dict):
+            if not isinstance(value, dict):
                 raise TypeError("Host Python worker response must be an object")
-            return response
+            return value
 
     def close(self) -> None:
         with self._state_lock:
@@ -180,6 +199,30 @@ class HostPythonBridge:
     def _worker_error(self, fallback: str) -> str:
         detail = "\n".join(self._stderr).strip()
         return detail or fallback
+
+
+def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
+    """Terminate a host process and the children that inherited its pipes.
+
+    The process runs in its own process group (see ``_stream_host_process``),
+    so signalling the group also reaches backgrounded children; otherwise
+    they keep the output pipes open and outlive the session as zombies.
+    The group is signalled even when the main process already exited,
+    because a backgrounded child may still hold the pipes open.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (AttributeError, OSError):
+        if process.poll() is None:
+            process.terminate()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, OSError):
+            process.kill()
+        process.wait(timeout=1)
 
 
 class NotebookSession:
@@ -289,7 +332,7 @@ class NotebookSession:
         *,
         cell_id: str,
         source: str,
-    ) -> Iterator[dict[str, Any]]:
+    ) -> Generator[dict[str, Any], None, None]:
         with self._execution_lock:
             self._assert_open()
             self.touch()
@@ -390,12 +433,20 @@ class NotebookSession:
         if not tokens:
             raise ValueError("Terminal command cannot be empty")
         executable = self.python.executable
-        if tokens[0] in {"pip", "pip3"}:
+        # A pip/python command with shell syntax (a pipe, redirect or
+        # separator) must go through the shell: the direct argv silently
+        # dropped the extra tokens, so `!pip list | grep foo` ignored the
+        # pipe entirely. A token ending in ";" is a separator attached to
+        # the previous word (`pip list; echo done`); a ";" inside a quoted
+        # -c string stays inside its token, so it is not misread.
+        if any(token in _SHELL_OPERATORS or token.endswith(";") for token in tokens):
+            argv = _shell_argv(command)
+        elif tokens[0] in {"pip", "pip3"}:
             argv = [executable, "-m", "pip", *tokens[1:]]
         elif tokens[0] in {"python", "python3"}:
             argv = [executable, *tokens[1:]]
         else:
-            argv = ["/bin/sh", "-lc", command]
+            argv = _shell_argv(command)
 
         yield from self._stream_host_process(argv, command=command)
 
@@ -435,7 +486,9 @@ class NotebookSession:
             ]
             return sorted(packages, key=lambda item: item["name"].lower())
 
-    def stream_package_install(self, packages: Sequence[str]) -> Iterator[dict[str, Any]]:
+    def stream_package_install(
+        self, packages: Sequence[str]
+    ) -> Generator[dict[str, Any], None, None]:
         if self.mode != "host" or self.python is None:
             raise ValueError("Package management requires a host Python runtime")
         with self._execution_lock:
@@ -480,6 +533,11 @@ class NotebookSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            # A process group of its own, so a timeout can kill backgrounded
+            # children that inherited the output pipes too; otherwise a
+            # grandchild keeps the pipes open and the pump threads never see
+            # EOF.
+            start_new_session=True,
         )
         with self._state_lock:
             if self._closed:
@@ -487,18 +545,37 @@ class NotebookSession:
                 raise BridgeCancelled("Notebook session was interrupted")
             self._active_terminal_process = process
         output: Queue[tuple[str, str | None]] = Queue(maxsize=128)
+        stop = threading.Event()
+
+        def offer(item: tuple[str, str | None]) -> bool:
+            """Queue an output item unless the consumer has gone away."""
+            while True:
+                try:
+                    output.put(item, timeout=0.1)
+                    return True
+                except Full:
+                    if stop.is_set():
+                        return False
 
         def pump(stream_name: str, stream: Any) -> None:
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             try:
-                while chunk := os.read(stream.fileno(), 4096):
+                while True:
+                    try:
+                        chunk = os.read(stream.fileno(), 4096)
+                    except (OSError, ValueError):
+                        break
+                    if not chunk:
+                        break
                     if text := decoder.decode(chunk):
-                        output.put((stream_name, text))
+                        if not offer((stream_name, text)):
+                            return
                 if text := decoder.decode(b"", final=True):
-                    output.put((stream_name, text))
+                    offer((stream_name, text))
             finally:
-                stream.close()
-                output.put((stream_name, None))
+                with suppress(OSError, ValueError):
+                    stream.close()
+                offer((stream_name, None))
 
         if process.stdout is None or process.stderr is None:
             process.kill()
@@ -516,7 +593,7 @@ class NotebookSession:
             while open_streams:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    process.kill()
+                    _terminate_process_tree(process)
                     raise subprocess.TimeoutExpired(command, timeout)
                 try:
                     stream_name, text = output.get(timeout=min(remaining, 0.1))
@@ -529,16 +606,18 @@ class NotebookSession:
             return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
             yield {"type": "command_result", "returnCode": return_code}
         finally:
+            stop.set()
             with self._state_lock:
                 if self._active_terminal_process is process:
                     self._active_terminal_process = None
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=1)
+            _terminate_process_tree(process)
+            for reader in readers:
+                reader.join(timeout=2)
+            with suppress(OSError, ValueError):
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
 
     def _host_process_env(self) -> dict[str, str]:
         if self.python is None:
@@ -578,8 +657,8 @@ class NotebookSession:
             self.bridge.cancel()
         else:
             self.bridge.close()
-        if terminal_process is not None and terminal_process.poll() is None:
-            terminal_process.terminate()
+        if terminal_process is not None:
+            _terminate_process_tree(terminal_process)
         with self._execution_lock:
             self._session.close()
 
@@ -641,15 +720,20 @@ class NotebookSessionManager:
                 environment=prepared.directory,
             )
         session_id = uuid4().hex
-        session = NotebookSession(
-            session_id=session_id,
-            mode=mode,
-            cwd=self.cwd,
-            python=python,
-            interactive_options=self._interactive_options,
-            session_snapshot=session_snapshot,
-        )
+        # Hold the lock while constructing and registering the session: the
+        # constructor starts the bridge (and may be slow in kedi.interactive),
+        # and a close_all() that ran between construction and registration
+        # would miss the session and leak it. close_all() blocks on the same
+        # lock, then closes the registered session.
         with self._lock:
+            session = NotebookSession(
+                session_id=session_id,
+                mode=mode,
+                cwd=self.cwd,
+                python=python,
+                interactive_options=self._interactive_options,
+                session_snapshot=session_snapshot,
+            )
             self._sessions[session_id] = session
         return session
 
@@ -842,10 +926,24 @@ def _json_result(value: object) -> dict[str, object] | None:
     if media is not None:
         return media
     try:
-        serialized = json.dumps(value)
+        serialized = json.dumps(value, allow_nan=False)
     except (TypeError, ValueError):
-        rendered = _truncate_output(repr(value))
-        return {"kind": "repr", "type": type(value).__name__, "value": rendered}
+        # Non-finite floats (NaN, Infinity) are not JSON, so Starlette's
+        # JSONResponse rejected the whole cell with a 400. Show them as the
+        # text the user would read instead of failing the cell.
+        sanitized = _sanitize_json_value(value)
+        if sanitized is _UNSANITIZABLE:
+            rendered = _truncate_output(repr(value))
+            return {"kind": "repr", "type": type(value).__name__, "value": rendered}
+        serialized = json.dumps(sanitized, allow_nan=False)
+        if len(serialized) > _OUTPUT_LIMIT:
+            return {
+                "kind": "repr",
+                "type": type(value).__name__,
+                "value": _truncate_output(serialized),
+                "truncated": True,
+            }
+        return {"kind": "json", "type": type(value).__name__, "value": sanitized}
     if len(serialized) > _OUTPUT_LIMIT:
         return {
             "kind": "repr",
@@ -854,6 +952,51 @@ def _json_result(value: object) -> dict[str, object] | None:
             "truncated": True,
         }
     return {"kind": "json", "type": type(value).__name__, "value": value}
+
+
+_UNSANITIZABLE: Final = object()
+
+
+def _sanitize_json_value(value: object, *, _seen: frozenset[int] = frozenset()) -> object:
+    """Replace non-finite floats with their names for JSON output.
+
+    Returns ``_UNSANITIZABLE`` for values that are not plain JSON data (custom
+    objects, sets, cyclic structures); those keep the ``repr`` fallback.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, Mapping):
+        if id(value) in _seen:
+            return _UNSANITIZABLE
+        seen = _seen | {id(value)}
+        sanitized: dict[object, object] = {}
+        for key, item in value.items():
+            clean_key = _sanitize_json_value(key, _seen=seen) if isinstance(key, float) else key
+            if clean_key is _UNSANITIZABLE:
+                return _UNSANITIZABLE
+            clean_item = _sanitize_json_value(item, _seen=seen)
+            if clean_item is _UNSANITIZABLE:
+                return _UNSANITIZABLE
+            sanitized[key] = clean_item
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        if id(value) in _seen:
+            return _UNSANITIZABLE
+        seen = _seen | {id(value)}
+        items: list[object] = []
+        for item in value:
+            clean_item = _sanitize_json_value(item, _seen=seen)
+            if clean_item is _UNSANITIZABLE:
+                return _UNSANITIZABLE
+            items.append(clean_item)
+        return items
+    return _UNSANITIZABLE
 
 
 def _media_displays(displays: list[dict[str, object]]) -> AbstractContextManager[None]:
@@ -957,6 +1100,17 @@ def _requires_runtime_reset(exc: BaseException) -> bool:
             else current.__cause__ or current.__context__
         )
     return False
+
+
+def _shell_argv(command: str) -> list[str]:
+    # /bin/sh does not exist on Windows; cmd.exe supports the same pipes and
+    # redirects the shell branch relies on.
+    if os.name == "nt":
+        return ["cmd.exe", "/c", command]
+    return ["/bin/sh", "-lc", command]
+
+
+_SHELL_OPERATORS: Final = frozenset({"|", "||", "&", "&&", ">", ">>", "<", "<<", ";"})
 
 
 def _terminal_commands(source: str) -> list[str]:

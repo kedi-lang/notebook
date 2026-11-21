@@ -114,6 +114,24 @@ class KediTreeSitterHighlighter {
     this.resultId = null;
     this.revision = 0;
     this.snapshots = new Map();
+    this.disposed = false;
+  }
+
+  // The parsers and the current tree are per-highlighter WASM allocations;
+  // the queries are shared resources from loadResources() and must not be
+  // deleted here. Called when the editor model is disposed so a new model
+  // does not leak another pair of parsers and a tree.
+  dispose() {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.tree?.delete();
+    this.tree = null;
+    this.parser.delete();
+    this.pythonParser.delete();
+    this.snapshots.clear();
+    this.tokens = new Uint32Array();
   }
 
   provide(source, lastResultId) {
@@ -164,7 +182,7 @@ class KediTreeSitterHighlighter {
 
 async function loadResources() {
   if (!resourcesPromise) {
-    resourcesPromise = (async () => {
+    const promise = (async () => {
       const [
         { Parser, Language, Query },
         kediHighlights,
@@ -196,6 +214,14 @@ async function loadResources() {
         injectionQuery: new Query(kediLanguage, kediInjections),
       };
     })();
+    resourcesPromise = promise;
+    // A rejected load must not stay cached: clear it so the next call
+    // retries instead of returning the same rejection forever.
+    promise.catch(() => {
+      if (resourcesPromise === promise) {
+        resourcesPromise = undefined;
+      }
+    });
   }
   return resourcesPromise;
 }
@@ -455,6 +481,7 @@ function pointAt(text, utf16Index) {
 }
 
 export const testing = {
+  KediTreeSitterHighlighter,
   encodeSemanticTokens,
   minimalTreeEdit,
   tokenEdits,
