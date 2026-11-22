@@ -7,6 +7,45 @@ import { Parser, Language, Query } from "../src/kedi_notebook/static/vendor/web-
 
 const staticRoot = new URL("../src/kedi_notebook/static/", import.meta.url);
 
+test("fallback shares model keyword coloring and supports ordered computed entries", async () => {
+  await Parser.init({
+    locateFile: () => fileURLToPath(new URL("vendor/web-tree-sitter.wasm", staticRoot)),
+  });
+  const language = await Language.load(
+    fileURLToPath(new URL("grammars/kedi/tree-sitter-kedi.wasm", staticRoot)),
+  );
+  const parser = new Parser();
+  parser.setLanguage(language);
+  const query = new Query(
+    language,
+    await readFile(new URL("grammars/kedi/highlights.scm", staticRoot), "utf8"),
+  );
+  const tree = parser.parse(
+    "> model: openai:primary\n" +
+    "> fallback: openai:backup\n" +
+    "> profile: resilient:\n" +
+    "  > if: `ready`:\n" +
+    "    > fallback:\n" +
+    "      openai:first\n" +
+    "      `choose_model()`\n",
+  );
+  try {
+    assert.equal(tree.rootNode.hasError, false);
+    const captures = query.captures(tree.rootNode);
+    const keywords = captures.filter((item) => item.name === "keyword").map((item) => item.node.text);
+    assert.ok(keywords.includes("model"));
+    assert.equal(keywords.filter((word) => word === "fallback").length, 2);
+    const entries = tree.rootNode.descendantsOfType("fallback_entry");
+    assert.deepEqual(entries.map((entry) => entry.childForFieldName("value").type), [
+      "directive_value", "inline_python_expr",
+    ]);
+  } finally {
+    tree.delete();
+    query.delete();
+    parser.delete();
+  }
+});
+
 test("shipped WASM and query support capabilities and deferred Python expressions", async () => {
   await Parser.init({
     locateFile: () => fileURLToPath(new URL("vendor/web-tree-sitter.wasm", staticRoot)),

@@ -45,6 +45,7 @@
 "agent" @keyword
 "adapter" @keyword
 "model" @keyword
+"fallback" @keyword
 "effort" @keyword
 "approval" @keyword
 "codemode" @keyword
@@ -232,6 +233,12 @@
 (model_directive
   value: (model_plain_value) @string)
 (model_directive
+  value: (inline_python_expr) @string.special)
+
+(directive_value) @string
+(fallback_directive
+  value: (inline_python_expr) @string.special)
+(fallback_entry
   value: (inline_python_expr) @string.special)
 
 (agent_directive
