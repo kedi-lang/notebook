@@ -17,11 +17,19 @@ const highlighters = new WeakMap();
 const lspContexts = new WeakMap();
 const diagnosticTimers = new WeakMap();
 const treeSitterResources = preloadKediTreeSitterResources();
+// The prewarm above may reject before any editor is created; mark the
+// rejection handled so it does not surface as unhandled. createKediEditor
+// calls preloadKediTreeSitterResources() fresh, which retries after a
+// failure because a rejected load clears the cached promise.
+treeSitterResources.catch(() => {});
 
 export async function createKediEditor(element, value, onChange, options = {}) {
   let monaco;
   try {
-    [monaco] = await Promise.all([loadMonaco(), treeSitterResources]);
+    [monaco] = await Promise.all([
+      loadMonaco(),
+      preloadKediTreeSitterResources(),
+    ]);
   } catch {
     return createFallbackEditor(element, value, onChange, options);
   }
@@ -267,7 +275,7 @@ async function loadMonaco() {
   if (monacoPromise) {
     return monacoPromise;
   }
-  monacoPromise = new Promise((resolve, reject) => {
+  const promise = new Promise((resolve, reject) => {
     const amdRequire = globalThis.require;
     if (!amdRequire?.config) {
       reject(new Error("Monaco AMD loader is unavailable"));
@@ -290,8 +298,20 @@ async function loadMonaco() {
     amdRequire.config({ paths: { vs: `${MONACO_BASE}/vs` } });
     amdRequire(["vs/editor/editor.main"], () => resolve(globalThis.monaco), reject);
   });
+  monacoPromise = promise;
+  // A rejected load must not stay cached: clear it so the next call retries
+  // instead of returning the same rejection forever.
+  promise.catch(() => {
+    if (monacoPromise === promise) {
+      monacoPromise = undefined;
+    }
+  });
   return monacoPromise;
 }
+
+export const testing = {
+  loadMonaco,
+};
 
 async function registerKediLanguage(monaco) {
   if (languageRegistered) {
@@ -314,6 +334,11 @@ async function registerKediLanguage(monaco) {
       if (!highlighterPromise) {
         highlighterPromise = createKediTreeSitterHighlighter();
         highlighters.set(model, highlighterPromise);
+        // The highlighter owns two WASM parsers and a tree per model; free
+        // them when the model goes away instead of leaking them per model.
+        model.onWillDispose(() => {
+          void highlighterPromise.then((created) => created.dispose());
+        });
       }
       const highlighter = await highlighterPromise;
       if (

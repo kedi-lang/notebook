@@ -30,6 +30,12 @@ export class PyodideRuntime {
 
   async #execute(request, io) {
     await this.preload();
+    // The worker can be terminated while preloading (dispose, or a worker
+    // error): without this check postMessage throws a bare TypeError on
+    // null instead of reporting the terminated worker.
+    if (!this.worker) {
+      throw new Error("Pyodide worker was terminated");
+    }
     const id = this.nextId;
     this.nextId += 1;
     return new Promise((resolve, reject) => {
@@ -42,7 +48,12 @@ export class PyodideRuntime {
         onStderr: io.onStderr,
         onExchange: io.onExchange,
       });
-      this.worker.postMessage({ id, request });
+      try {
+        this.worker.postMessage({ id, request });
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 

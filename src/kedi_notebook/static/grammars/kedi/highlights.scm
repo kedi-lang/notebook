@@ -123,6 +123,7 @@
   name: (identifier) @variable.builtin)
 (text_segment) @string
 (condition_text_segment) @string
+(text_in_call_segment) @string
 
 ; ----------------------------------------------------------------
 ; Type expressions

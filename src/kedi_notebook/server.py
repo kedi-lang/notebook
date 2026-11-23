@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .host_environment import HostEnvironmentProvider
 from .pyright import PyrightServer
-from .runtime import NotebookSessionManager
+from .runtime import NotebookSession, NotebookSessionManager
 from .secrets import NotebookSecretStore
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -190,6 +190,21 @@ def create_app(
                     if request.url.path == "/api/notebook/sessions/restore"
                     else _MAX_REQUEST_BYTES
                 ),
+            ):
+                response = JSONResponse(
+                    {"ok": False, "error": "Request body is too large"},
+                    status_code=413,
+                )
+            elif (
+                await _read_body_within_limit(
+                    request,
+                    limit=(
+                        _MAX_RESTORE_REQUEST_BYTES
+                        if request.url.path == "/api/notebook/sessions/restore"
+                        else _MAX_REQUEST_BYTES
+                    ),
+                )
+                is None
             ):
                 response = JSONResponse(
                     {"ok": False, "error": "Request body is too large"},
@@ -366,19 +381,14 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - API boundary.
             return _error_response(exc)
 
-        def events() -> Iterator[str]:
-            runtime_reset = False
-            for event in session.stream_terminal(
+        return StreamingResponse(
+            _terminal_events(
+                manager,
+                session,
+                session_id,
                 cell_id=payload.cell_id,
                 source=payload.source,
-            ):
-                runtime_reset = runtime_reset or event.get("runtimeReset") is True
-                yield json.dumps(event, separators=(",", ":")) + "\n"
-            if runtime_reset:
-                manager.close(session_id)
-
-        return StreamingResponse(
-            events(),
+            ),
             media_type="application/x-ndjson",
             headers={"X-Content-Type-Options": "nosniff"},
         )
@@ -449,12 +459,8 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - API boundary.
             return _error_response(exc)
 
-        def events() -> Iterator[str]:
-            for event in session.stream_package_install(payload.packages):
-                yield json.dumps(event, separators=(",", ":")) + "\n"
-
         return StreamingResponse(
-            events(),
+            _package_install_events(manager, session, session_id, packages=payload.packages),
             media_type="application/x-ndjson",
             headers={"X-Content-Type-Options": "nosniff"},
         )
@@ -464,12 +470,15 @@ def create_app(
         from kedi.lsp.features import compute_hover
         from lsprotocol import types as lsp
 
-        python_hover = await asyncio.to_thread(
-            pyright.hover,
-            payload.source,
-            payload.line,
-            payload.character,
-        )
+        try:
+            python_hover = await asyncio.to_thread(
+                pyright.hover,
+                payload.source,
+                payload.line,
+                payload.character,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_hover = None
         if python_hover is not None:
             return {"ok": True, "hover": python_hover, "provider": "pyright"}
         result = compute_hover(
@@ -531,12 +540,15 @@ def create_app(
         from kedi.lsp.features import compute_completion
         from lsprotocol import types as lsp
 
-        python_items = await asyncio.to_thread(
-            pyright.completion,
-            payload.source,
-            payload.line,
-            payload.character,
-        )
+        try:
+            python_items = await asyncio.to_thread(
+                pyright.completion,
+                payload.source,
+                payload.line,
+                payload.character,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_items = None
         if python_items is not None:
             return {"ok": True, "items": python_items, "provider": "pyright"}
         items = await asyncio.to_thread(
@@ -608,13 +620,16 @@ def create_app(
         from kedi.lsp.features import compute_references
         from lsprotocol import types as lsp
 
-        python_locations = await asyncio.to_thread(
-            pyright.references,
-            payload.source,
-            payload.line,
-            payload.character,
-            include_declaration=payload.include_declaration,
-        )
+        try:
+            python_locations = await asyncio.to_thread(
+                pyright.references,
+                payload.source,
+                payload.line,
+                payload.character,
+                include_declaration=payload.include_declaration,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_locations = None
         if python_locations is not None:
             return {"ok": True, "references": python_locations, "provider": "pyright"}
         locations = await asyncio.to_thread(
@@ -636,12 +651,15 @@ def create_app(
         from kedi.lsp.features import compute_prepare_rename
         from lsprotocol import types as lsp
 
-        python_result = await asyncio.to_thread(
-            pyright.prepare_rename,
-            payload.source,
-            payload.line,
-            payload.character,
-        )
+        try:
+            python_result = await asyncio.to_thread(
+                pyright.prepare_rename,
+                payload.source,
+                payload.line,
+                payload.character,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_result = None
         if python_result is not None:
             return {"ok": True, "rename": python_result, "provider": "pyright"}
         range_ = await asyncio.to_thread(
@@ -661,13 +679,16 @@ def create_app(
         from kedi.lsp.features import compute_rename
         from lsprotocol import types as lsp
 
-        python_edits = await asyncio.to_thread(
-            pyright.rename,
-            payload.source,
-            payload.line,
-            payload.character,
-            payload.new_name,
-        )
+        try:
+            python_edits = await asyncio.to_thread(
+                pyright.rename,
+                payload.source,
+                payload.line,
+                payload.character,
+                payload.new_name,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            python_edits = None
         if python_edits is not None:
             return {"ok": True, "edits": python_edits, "provider": "pyright"}
         workspace_edit = await asyncio.to_thread(
@@ -781,9 +802,57 @@ def _resolve_dotenv_path(raw_path: str, *, cwd: Path) -> Path:
         raise ValueError("The selected .env file does not exist") from exc
     if not resolved.is_file():
         raise ValueError("The selected .env path is not a file")
+    if not resolved.is_relative_to(cwd):
+        raise ValueError("The selected .env file must be inside the notebook directory")
     if resolved.stat().st_size > _MAX_DOTENV_BYTES:
         raise ValueError("The selected .env file is larger than 1 MB")
     return resolved
+
+
+def _terminal_events(
+    manager: NotebookSessionManager,
+    session: NotebookSession,
+    session_id: str,
+    *,
+    cell_id: str,
+    source: str,
+) -> Iterator[str]:
+    runtime_reset = False
+    iterator = iter(session.stream_terminal(cell_id=cell_id, source=source))
+    try:
+        for event in iterator:
+            runtime_reset = runtime_reset or event.get("runtimeReset") is True
+            yield json.dumps(event, separators=(",", ":")) + "\n"
+    finally:
+        # A disconnect closes this generator: stop the terminal stream
+        # (releasing the execution lock and terminating the process) instead
+        # of leaving it running, and still apply the runtime reset the
+        # client never read.
+        iterator.close()
+        if runtime_reset:
+            manager.close(session_id)
+
+
+def _package_install_events(
+    manager: NotebookSessionManager,
+    session: NotebookSession,
+    session_id: str,
+    *,
+    packages: Sequence[str],
+) -> Iterator[str]:
+    runtime_reset = False
+    iterator = iter(session.stream_package_install(packages))
+    try:
+        for event in iterator:
+            runtime_reset = runtime_reset or event.get("runtimeReset") is True
+            yield json.dumps(event, separators=(",", ":")) + "\n"
+    finally:
+        # A disconnect closes this generator: stop the install stream
+        # (releasing the execution lock and terminating pip) instead of
+        # leaving it running.
+        iterator.close()
+        if runtime_reset:
+            manager.close(session_id)
 
 
 def _error_response(exc: BaseException) -> JSONResponse:
@@ -829,6 +898,29 @@ def _request_too_large(request: Request, *, limit: int) -> bool:
         return int(content_length) > limit
     except ValueError:
         return True
+
+
+async def _read_body_within_limit(request: Request, *, limit: int) -> bytes | None:
+    """Read the request body, enforcing ``limit`` even without Content-Length.
+
+    A chunked (or otherwise length-less) body used to bypass the size check
+    entirely. Returns the body, or ``None`` once more than ``limit`` bytes
+    arrive. Bodies already bounded by a Content-Length header are left for
+    the endpoint to read; the read body is cached on the request so the
+    endpoint reuses it instead of reading the stream twice.
+    """
+    if request.headers.get("content-length") is not None:
+        return b""
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    request._body = body  # noqa: SLF001 - Starlette's Request.body() cache.
+    return body
 
 
 def _range_payload(range_: Any) -> dict[str, dict[str, int]]:

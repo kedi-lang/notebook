@@ -7,9 +7,11 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,13 @@ class _PassthroughHostEnvironment:
 
 
 _PASSTHROUGH_HOST_ENVIRONMENT = _PassthroughHostEnvironment()
+
+
+# Static assets ship inside the kedi_notebook package. Resolve them relative
+# to this file so the suite also runs from the kedi repo root, where CI
+# invokes it as `pytest notebook/tests`, instead of assuming cwd is the
+# notebook repo root.
+_STATIC_ROOT = Path(__file__).resolve().parent.parent / "src" / "kedi_notebook" / "static"
 
 
 @pytest.fixture(autouse=True)
@@ -1408,3 +1417,970 @@ def test_media_results_without_kedi_media_fall_back_to_json(
 
     monkeypatch.setattr(builtins, "__import__", missing_media)
     assert notebook_runtime._json_result([1]) == {"kind": "json", "type": "list", "value": [1]}
+
+
+# Audit #215 item 1: process-control names must never become server secrets.
+BLOCKED_PROCESS_CONTROL_NAMES = [
+    "PATH",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "PYTHONBREAKPOINT",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "UV_INDEX_URL",
+    "UV_PYTHON",
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "VIRTUAL_ENV",
+    "HOME",
+    "SHELL",
+    "BASH_ENV",
+    "ENV",
+]
+
+
+@pytest.mark.parametrize("name", BLOCKED_PROCESS_CONTROL_NAMES)
+def test_notebook_secret_api_rejects_process_control_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    monkeypatch.delenv(name, raising=False)
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.put(
+            "/api/notebook/secrets",
+            json={"name": name, "value": "injected"},
+        )
+
+    assert response.status_code == 400
+    assert name in response.json()["error"]
+    assert "controls the notebook process" in response.json()["error"]
+    assert name not in os.environ
+    assert app.state.notebook_secret_store.names == ()
+
+
+def test_notebook_secret_api_still_accepts_provider_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.put(
+            "/api/notebook/secrets",
+            json={"name": "OPENAI_API_KEY", "value": "not-a-real-key"},
+        )
+
+    assert response.status_code == 200
+    assert os.environ["OPENAI_API_KEY"] == "not-a-real-key"
+
+
+def test_notebook_secret_api_import_dotenv_rejects_process_control_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    (tmp_path / "import.env").write_text(
+        "PYTHONPATH=/tmp/evil\nOPENAI_API_KEY=not-a-real-key\n",
+        encoding="utf-8",
+    )
+    app = create_app(
+        cwd=tmp_path,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "import.env"},
+        )
+
+    assert response.status_code == 400
+    assert "PYTHONPATH" in response.json()["error"]
+    assert "PYTHONPATH" not in os.environ
+    # The import is atomic: a blocked name rejects the whole file.
+    assert app.state.notebook_secret_store.names == ()
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_notebook_secret_store_drops_process_control_names_on_disk_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    path = tmp_path / "secrets.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "secrets": {
+                    "PYTHONPATH": "/tmp/evil",
+                    "OPENAI_API_KEY": "not-a-real-key",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = NotebookSecretStore(path)
+    store.apply_to_environment()
+
+    assert store.names == ("OPENAI_API_KEY",)
+    assert "PYTHONPATH" not in os.environ
+    assert os.environ["OPENAI_API_KEY"] == "not-a-real-key"
+
+
+# Audit #215 item 2: dotenv imports must stay inside the notebook directory.
+def test_notebook_secret_api_import_dotenv_rejects_paths_outside_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LEAKED_VALUE", raising=False)
+    monkeypatch.delenv("OUTSIDE_VALUE", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "leaked.env").write_text("OUTSIDE_VALUE=from-outside\n", encoding="utf-8")
+    (project / ".env").write_text("LEAKED_VALUE=from-dotenv\n", encoding="utf-8")
+    app = create_app(
+        cwd=project,
+        secret_store=NotebookSecretStore(tmp_path / "secrets.json"),
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        traversal = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "../outside/leaked.env"},
+        )
+        assert traversal.status_code == 400
+        assert "inside the notebook directory" in traversal.json()["error"]
+        # The file outside the cwd was never read.
+        assert "OUTSIDE_VALUE" not in os.environ
+
+        absolute = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "/etc/passwd"},
+        )
+        assert absolute.status_code == 400
+        home = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "~/.env"},
+        )
+        assert home.status_code == 400
+
+        inside = client.post(
+            "/api/notebook/secrets/import-dotenv",
+            json={"path": "./.env"},
+        )
+        assert inside.status_code == 200
+        assert inside.json()["imported"] == ["LEAKED_VALUE"]
+        assert os.environ["LEAKED_VALUE"] == "from-dotenv"
+
+
+# Audit #215 item 3: a chunked body must hit the same size limit as one with
+# Content-Length.
+def test_notebook_api_rejects_chunked_body_over_limit(tmp_path: Path) -> None:
+    app = create_app(cwd=tmp_path)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    base_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    server = _notebook_server(app, uvicorn.Config(app, log_level="warning"))
+    serving = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+    serving.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started
+
+        def oversized_chunks() -> Iterator[bytes]:
+            for _ in range(100):
+                yield b"x" * 100_000  # 10 MB total, no Content-Length.
+
+        # trust_env=False: the sandbox sets proxy variables httpx cannot parse.
+        with httpx.Client(trust_env=False, timeout=30) as http:
+            oversized = http.post(
+                f"{base_url}/api/lsp/diagnostics",
+                content=oversized_chunks(),
+                headers={"Content-Type": "application/json"},
+            )
+            assert oversized.status_code == 413
+
+            small = http.post(
+                f"{base_url}/api/lsp/diagnostics",
+                content=iter([b'{"source": ""}']),
+                headers={"Content-Type": "application/json"},
+            )
+            assert small.status_code == 200
+    finally:
+        server.should_exit = True
+        serving.join(timeout=10)
+
+
+# Audit #215 item 6: non-finite floats are shown as text, not a failed cell.
+def test_json_result_shows_nan_and_infinity_as_text() -> None:
+    assert notebook_runtime._json_result(float("nan")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "NaN",
+    }
+    assert notebook_runtime._json_result(float("inf")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "Infinity",
+    }
+    assert notebook_runtime._json_result(float("-inf")) == {
+        "kind": "json",
+        "type": "float",
+        "value": "-Infinity",
+    }
+    nested = notebook_runtime._json_result(
+        {"a": float("nan"), "b": [1, float("inf"), {"c": float("-inf")}]}
+    )
+    assert nested == {
+        "kind": "json",
+        "type": "dict",
+        "value": {"a": "NaN", "b": [1, "Infinity", {"c": "-Infinity"}]},
+    }
+    for value in (
+        float("nan"),
+        float("inf"),
+        {"a": float("nan")},
+        [float("-inf")],
+    ):
+        result = notebook_runtime._json_result(value)
+        assert result is not None
+        # The payload must survive Starlette's strict JSON encoding.
+        json.dumps(result, allow_nan=False)
+
+
+def test_json_result_keeps_repr_fallback_for_cyclic_values() -> None:
+    cyclic: dict[str, object] = {"value": float("nan")}
+    cyclic["self"] = cyclic
+
+    result = notebook_runtime._json_result(cyclic)
+
+    assert result is not None and result["kind"] == "repr"
+    assert "nan" in str(result["value"])
+    json.dumps(result, allow_nan=False)
+
+
+def test_notebook_api_returns_nan_cell_result_instead_of_failing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(cwd=tmp_path)
+    session = app.state.notebook_manager.create(mode="browser")
+    original_execute = session._session.execute
+
+    def execute(source: str, *, source_name: str | None = None) -> object:
+        # Interactive cells cannot return a top-level value (root returns are
+        # rejected), so the session result is stubbed here: the layer under
+        # test is result serialization, not Kedi semantics.
+        if "nan" in source:
+            return float("nan")
+        if "inf" in source:
+            return float("inf")
+        return original_execute(source, source_name=source_name)
+
+    monkeypatch.setattr(session._session, "execute", execute)
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        nan = client.post(
+            f"/api/notebook/sessions/{session.id}/cells/execute",
+            json={"cellId": "nan", "source": "> show: `float('nan')`"},
+        )
+        inf = client.post(
+            f"/api/notebook/sessions/{session.id}/cells/execute",
+            json={"cellId": "inf", "source": "> show: `float('inf')`"},
+        )
+
+    assert nan.status_code == 200
+    assert nan.json()["ok"] is True
+    assert nan.json()["result"] == {"kind": "json", "type": "float", "value": "NaN"}
+    assert inf.status_code == 200
+    assert inf.json()["result"] == {"kind": "json", "type": "float", "value": "Infinity"}
+
+
+# Audit #215 item 7: a forged protocol reply written to fd 1 must be ignored.
+def test_host_worker_ignores_forged_fd1_protocol_replies(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        forged = session.execute(
+            cell_id="forge",
+            source=(
+                "```\n"
+                "import json, os\n"
+                "os.write(1, (\n"
+                "    '__KEDI_NOTEBOOK_RESPONSE__'\n"
+                "    + json.dumps({'ok': True, 'result': 'FORGED-BY-USER-CODE', 'env': {}})\n"
+                "    + '\\n'\n"
+                ").encode())\n"
+                "```"
+            ),
+        )
+        after = session.execute(cell_id="after", source="> show: `1 + 1`")
+    finally:
+        manager.close_all()
+
+    assert forged["ok"] is True
+    assert "FORGED-BY-USER-CODE" not in json.dumps(forged)
+    # The next request must get its own real response, not the forged one.
+    assert after["ok"] is True
+    assert after["stdout"] == "2\n"
+
+
+# Audit #215 item 9: a timed-out or abandoned host process must not leak pump
+# threads, pipe FDs or zombies.
+def _process_resources() -> tuple[set[threading.Thread], int]:
+    # /proc/self/fd is Linux-only; macOS exposes the same entries via /dev/fd.
+    for fd_dir in ("/proc/self/fd", "/dev/fd"):
+        if os.path.isdir(fd_dir):
+            return set(threading.enumerate()), len(os.listdir(fd_dir))
+    raise RuntimeError("no file-descriptor directory found")
+
+
+def _assert_resources_released(
+    before_threads: set[threading.Thread],
+    before_fds: int,
+    *,
+    timeout: float = 10,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        threads, fds = _process_resources()
+        if threads <= before_threads and fds <= before_fds:
+            return
+        time.sleep(0.05)
+    threads, fds = _process_resources()
+    assert threads <= before_threads, f"leaked threads: {threads - before_threads}"
+    assert fds <= before_fds, f"leaked FDs: {fds} > {before_fds}"
+
+
+def test_stream_host_process_timeout_reaps_grandchild_holding_pipe(
+    tmp_path: Path,
+) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        before_threads, before_fds = _process_resources()
+        started = time.monotonic()
+        events = session._stream_host_process(  # noqa: SLF001 - leak under test.
+            ["/bin/sh", "-lc", "sleep 30 & echo started"],
+            command="sleep 30 & echo started",
+            timeout=2,
+        )
+        with pytest.raises(subprocess.TimeoutExpired):
+            list(events)
+        # The timeout is 2s; cleanup must not wait out the 30s grandchild.
+        assert time.monotonic() - started < 15
+        _assert_resources_released(before_threads, before_fds)
+    finally:
+        manager.close_all()
+
+
+def test_stream_host_process_abandoned_generator_releases_threads_and_fds(
+    tmp_path: Path,
+) -> None:
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        before_threads, before_fds = _process_resources()
+        events = session._stream_host_process(  # noqa: SLF001 - leak under test.
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "for i in range(100000): print('x' * 200)",
+            ],
+            command="fast producer",
+            timeout=30,
+        )
+        first = next(events)
+        assert first["type"] == "output"
+        # Let the fast producer fill the bounded output queue first, so the
+        # pumps are blocked in put() when the consumer goes away.
+        time.sleep(0.5)
+        events.close()  # Consumer goes away mid-stream.
+        _assert_resources_released(before_threads, before_fds)
+    finally:
+        manager.close_all()
+
+
+# Audit #215 item 10: worker string corruption, cycles, registry bound.
+def test_sandbox_worker_keeps_multiline_string_contents() -> None:
+    response = handle_request(
+        {
+            "action": "execute_block",
+            "code": 'x = """\nalpha\nbeta\n"""',
+            "syncNames": ["x"],
+            "env": {},
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["env"] == {"x": "\nalpha\nbeta\n"}
+
+
+def test_sandbox_worker_turns_cyclic_values_into_references() -> None:
+    import kedi_notebook.sandbox_worker as worker
+
+    created = handle_request(
+        {
+            "action": "execute_block",
+            "code": 'd = {}\nd["self"] = d',
+            "syncNames": ["d"],
+            "env": {},
+        }
+    )
+    assert created["ok"] is True
+    ref = created["env"]["d"]
+    assert set(ref) == {"__kedi_notebook_ref__"}
+    handle = ref["__kedi_notebook_ref__"]
+    assert isinstance(handle, str)
+    assert worker._OBJECT_REGISTRY[handle]["self"] is worker._OBJECT_REGISTRY[handle]
+
+    # The same value as an inline result fails clearly instead of RecursionError.
+    evaluated = handle_request(
+        {"action": "evaluate_inline", "code": "d", "syncNames": [], "env": {}},
+    )
+    assert evaluated["ok"] is False
+    assert "Cyclic" in evaluated["error"]
+    assert "RecursionError" not in evaluated["error"]
+
+
+def test_sandbox_worker_object_registry_is_bounded() -> None:
+    import kedi_notebook.sandbox_worker as worker
+
+    saved = dict(worker._OBJECT_REGISTRY)
+    try:
+        worker._OBJECT_REGISTRY.clear()
+        handles = [worker._register_object(object()) for _ in range(1100)]
+        assert len(set(handles)) == 1100
+        assert len(worker._OBJECT_REGISTRY) <= 1024
+        # Oldest entries are evicted first.
+        assert handles[0] not in worker._OBJECT_REGISTRY
+        assert handles[-1] in worker._OBJECT_REGISTRY
+    finally:
+        worker._OBJECT_REGISTRY.clear()
+        worker._OBJECT_REGISTRY.update(saved)
+
+
+def _load_pyodide_driver_namespace(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Execute the Python DRIVER_SETUP shipped inside pyodide-worker.js."""
+    import types as stdlib_types
+
+    source = (_STATIC_ROOT / "pyodide-worker.js").read_text(encoding="utf-8")
+    marker = "const DRIVER_SETUP = String.raw`"
+    start = source.index(marker) + len(marker)
+    end = source.index("\n`;", start)
+    driver = source[start:end]
+    js = stdlib_types.ModuleType("js")
+    js.kediExchange = lambda message: "{}"
+    js.kediStreamOutput = lambda stream, text: None
+    monkeypatch.setitem(sys.modules, "js", js)
+    namespace: dict[str, Any] = {"__name__": "pyodide_driver_test"}
+    exec(compile(driver, "<pyodide-worker-driver>", "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+def test_pyodide_worker_keeps_multiline_string_contents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_pyodide_driver_namespace(monkeypatch)
+    namespace: dict[str, Any] = {}
+    driver["_run_block"](namespace, 'x = """\nalpha\nbeta\n"""', ["x"])
+
+    assert namespace["x"] == "\nalpha\nbeta\n"
+
+
+def test_pyodide_worker_turns_cyclic_values_into_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_pyodide_driver_namespace(monkeypatch)
+    namespace: dict[str, Any] = {}
+    driver["_run_block"](namespace, 'd = {}\nd["self"] = d', ["d"])
+    encoded = driver["_serializable_namespace"](namespace, ["d"])
+
+    assert set(encoded["d"]) == {"__kedi_notebook_ref__"}
+    handle = encoded["d"]["__kedi_notebook_ref__"]
+    assert driver["_OBJECT_REGISTRY"][handle] is namespace["d"]
+    with pytest.raises(TypeError, match="Cyclic"):
+        driver["_to_json"](namespace["d"])
+
+
+def test_pyodide_worker_object_registry_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_pyodide_driver_namespace(monkeypatch)
+    registry = driver["_OBJECT_REGISTRY"]
+    saved = dict(registry)
+    try:
+        registry.clear()
+        handles = [driver["_register_object"](object()) for _ in range(1100)]
+        assert len(set(handles)) == 1100
+        assert len(registry) <= 1024
+        assert handles[0] not in registry
+        assert handles[-1] in registry
+    finally:
+        registry.clear()
+        registry.update(saved)
+
+
+# Audit #215 item 11: a failing Pyright must fall back to Kedi, not 500.
+def test_notebook_lsp_endpoints_fall_back_to_kedi_when_pyright_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kedi_notebook.pyright import PyrightServer
+
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("Pyright language server stopped")
+
+    for method in ("hover", "completion", "references", "prepare_rename", "rename"):
+        monkeypatch.setattr(PyrightServer, method, failing)
+    app = create_app(cwd=tmp_path)
+    source = "[value: int] = `1`\n[value] := `value + 1`\n> show: <value>"
+    position = {"source": source, "line": 2, "character": 10}
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        hover = client.post("/api/lsp/hover", json=position)
+        completion = client.post("/api/lsp/completion", json=position)
+        references = client.post(
+            "/api/lsp/references", json={**position, "includeDeclaration": True}
+        )
+        prepared = client.post("/api/lsp/prepare-rename", json=position)
+        renamed = client.post("/api/lsp/rename", json={**position, "newName": "count"})
+
+    assert hover.status_code == 200
+    assert hover.json()["provider"] == "kedi"
+    assert completion.status_code == 200
+    assert completion.json()["provider"] == "kedi"
+    assert references.status_code == 200
+    assert references.json()["provider"] == "kedi"
+    assert prepared.status_code == 200
+    assert prepared.json()["provider"] == "kedi"
+    assert renamed.status_code == 200
+    assert renamed.json()["provider"] == "kedi"
+
+
+# Audit #215 item 12: secret store lock, symlink check, self-blocking size.
+def test_notebook_secret_store_keeps_concurrent_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "secrets.json"
+    store = NotebookSecretStore(path)
+
+    def write_batch(thread_index: int) -> None:
+        for item_index in range(50):
+            store.set(f"KEY_{thread_index}_{item_index}", "value")
+
+    workers = [threading.Thread(target=write_batch, args=(index,)) for index in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=30)
+    assert not any(worker.is_alive() for worker in workers)
+
+    reloaded = NotebookSecretStore(path)
+    assert len(reloaded.names) == 200
+
+
+def test_notebook_secret_store_rejects_writes_it_could_not_read_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "secrets.json"
+    store = NotebookSecretStore(path)
+    value = "x" * 128_000
+    for index in range(7):
+        store.set(f"LARGE_{index}", value)
+    assert path.stat().st_size <= 1_000_000
+
+    with pytest.raises(ValueError, match="would exceed 1 MB"):
+        store.set("LARGE_7", value)
+
+    # The file on disk still loads: the store never blocks itself.
+    assert len(NotebookSecretStore(path).names) == 7
+
+
+def test_notebook_secret_store_refuses_broken_symlink(tmp_path: Path) -> None:
+    path = tmp_path / "secrets.json"
+    path.symlink_to(tmp_path / "missing-target")
+
+    with pytest.raises(RuntimeError, match="cannot be a symbolic link"):
+        NotebookSecretStore(path)
+
+    real = NotebookSecretStore(tmp_path / "real.json")
+    real.set("KEPT", "value")
+    real_path = tmp_path / "real.json"
+    real_path.unlink()
+    real_path.symlink_to(tmp_path / "missing-target")
+    with pytest.raises(RuntimeError, match="cannot be a symbolic link"):
+        real.set("OTHER", "value")
+
+
+def _run_pyodide_terminal_driver(
+    monkeypatch: pytest.MonkeyPatch, command: str
+) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+    """Run the TERMINAL_DRIVER shipped inside pyodide-worker.js in CPython."""
+    import textwrap
+    import types as stdlib_types
+
+    source = (_STATIC_ROOT / "pyodide-worker.js").read_text(encoding="utf-8")
+    marker = "const TERMINAL_DRIVER = String.raw`"
+    start = source.index(marker) + len(marker)
+    end = source.index("\n`;", start)
+    driver = source[start:end]
+
+    streamed: list[tuple[str, str]] = []
+    installed: list[list[str]] = []
+
+    micropip = stdlib_types.ModuleType("micropip")
+
+    async def install(packages: list[str]) -> None:
+        installed.append(list(packages))
+
+    micropip.install = install
+    monkeypatch.setitem(sys.modules, "micropip", micropip)
+
+    namespace: dict[str, Any] = {
+        "__name__": "pyodide_terminal_driver_test",
+        "__kedi_terminal_command_json": json.dumps(command),
+        "kediStreamOutput": lambda stream, text: streamed.append((stream, text)),
+    }
+    wrapped = "async def __kedi_terminal_driver():\n" + textwrap.indent(driver, "    ")
+    wrapped += "\n    return __kedi_terminal_response\n"
+    exec(compile(wrapped, "<pyodide-worker-terminal>", "exec"), namespace)  # noqa: S102
+    response = asyncio.run(namespace["__kedi_terminal_driver"]())
+    return response, streamed
+
+
+# Audit #215 item 13: the install response must repeat the streamed output so
+# the host dedup strips it, instead of showing "Installed ..." twice.
+def test_pyodide_terminal_install_response_repeats_streamed_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response, streamed = _run_pyodide_terminal_driver(monkeypatch, "pip install foo")
+
+    assert response["ok"] is True
+    assert streamed == [
+        ("stdout", "Installing foo...\n"),
+        ("stdout", "Installed foo in the browser runtime.\n"),
+    ]
+    assert response["stdout"] == "".join(text for _, text in streamed)
+
+
+def test_browser_terminal_install_output_appears_once(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(cwd=tmp_path)
+    session = manager.create(mode="browser")
+    release_response = threading.Event()
+
+    def serve_terminal() -> None:
+        request = session.next_browser_request(timeout=1)
+        assert request is not None
+        request_id = request.pop("id")
+        assert request == {"action": "execute_terminal", "command": "pip install foo"}
+        session.submit_browser_output(request_id, stream="stdout", text="Installing foo...\n")
+        session.submit_browser_output(
+            request_id, stream="stdout", text="Installed foo in the browser runtime.\n"
+        )
+        assert release_response.wait(timeout=2)
+        session.submit_browser_response(
+            request_id,
+            {
+                "ok": True,
+                "stdout": "Installing foo...\nInstalled foo in the browser runtime.\n",
+                "stderr": "",
+            },
+        )
+
+    worker = threading.Thread(target=serve_terminal)
+    worker.start()
+    try:
+        events = session.stream_terminal(cell_id="packages", source="!pip install foo")
+        first = next(events)
+        assert first == {
+            "type": "output",
+            "stream": "stdout",
+            "text": "Installing foo...\n",
+        }
+        release_response.set()
+        remaining = list(events)
+    finally:
+        release_response.set()
+        manager.close_all()
+        worker.join(timeout=2)
+
+    outputs = [
+        event
+        for event in [first, *remaining]
+        if event.get("type") == "output" and event.get("stream") == "stdout"
+    ]
+    combined = "".join(event["text"] for event in outputs)
+    assert combined == "Installing foo...\nInstalled foo in the browser runtime.\n"
+    assert combined.count("Installed foo in the browser runtime.\n") == 1
+
+
+# Audit #215 item 14: closing a terminal stream mid-way (as a disconnect
+# does) must still apply a runtimeReset the client never read, instead of
+# leaking the session. The HTTP layer cannot be used for this: in this stack
+# (uvicorn 0.54 + Starlette 1.6.0) a disconnect only stops the stream from
+# being pulled and the generator is closed when the stream ends, so the
+# observable behaviour is the generator's close path, tested here directly.
+def test_notebook_terminal_stream_close_applies_runtime_reset(tmp_path: Path) -> None:
+    from kedi_notebook.server import _terminal_events
+
+    app = create_app(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    manager = app.state.notebook_manager
+    session = manager.create(mode="host")
+
+    def fake_stream_terminal(*args: Any, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield {"type": "output", "stream": "stdout", "text": "hello\n"}
+        # Starlette pulls the next chunk before noticing the disconnect, so
+        # this reset is observed even though the client never reads it.
+        yield {
+            "type": "result",
+            "ok": False,
+            "runtimeReset": True,
+            "error": "TimeoutExpired: command timed out",
+        }
+        yield {"type": "output", "stream": "stdout", "text": "more\n"}
+
+    session.stream_terminal = fake_stream_terminal  # type: ignore[method-assign]
+    events = _terminal_events(manager, session, session.id, cell_id="t1", source="!sleep 30")
+    assert "hello" in next(events)
+    assert "runtimeReset" in next(events)
+    events.close()  # The disconnect closes the response generator.
+
+    with pytest.raises(KeyError):
+        manager.get(session.id)
+
+
+def test_notebook_terminal_stream_close_without_reset_keeps_session(
+    tmp_path: Path,
+) -> None:
+    from kedi_notebook.server import _terminal_events
+
+    app = create_app(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    manager = app.state.notebook_manager
+    session = manager.create(mode="host")
+
+    def fake_stream_terminal(*args: Any, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield {"type": "output", "stream": "stdout", "text": "hello\n"}
+        yield {"type": "output", "stream": "stdout", "text": "more\n"}
+
+    session.stream_terminal = fake_stream_terminal  # type: ignore[method-assign]
+    events = _terminal_events(manager, session, session.id, cell_id="t1", source="!echo hi")
+    assert "hello" in next(events)
+    events.close()
+
+    assert manager.get(session.id) is session
+    manager.close(session.id)
+
+
+def test_notebook_bridge_manager_is_gone() -> None:
+    import kedi_notebook.bridge as bridge_module
+
+    assert not hasattr(bridge_module, "BridgeManager")
+    assert "BridgeManager" not in bridge_module.__all__
+
+
+def _event_listener_body(source: str, event: str) -> str:
+    """Return the body of the first window.addEventListener(event, ...) handler."""
+    marker = f'window.addEventListener("{event}", '
+    start = source.index(marker) + len(marker)
+    body_start = source.index("{", start)
+    depth = 0
+    for index in range(body_start, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[body_start + 1 : index]
+    raise AssertionError(f"unbalanced braces in {event} handler")
+
+
+# Audit #215 item 5: leaving the page must not delete the session when the
+# user stays; the cleanup belongs on pagehide, not beforeunload.
+def test_notebook_pagehide_deletes_session_and_beforeunload_only_warns() -> None:
+    source = (_STATIC_ROOT / "notebook" / "notebook.js").read_text(encoding="utf-8")
+    pagehide = _event_listener_body(source, "pagehide")
+    assert "persistDraft()" in pagehide
+    assert 'method: "DELETE"' in pagehide
+    assert "browserBridge?.stop()" in pagehide
+    assert "browserRuntime?.dispose()" in pagehide
+
+    beforeunload = _event_listener_body(source, "beforeunload")
+    assert "returnValue" in beforeunload
+    assert "DELETE" not in beforeunload
+    assert "browserBridge" not in beforeunload
+    assert "browserRuntime" not in beforeunload
+
+
+# Audit #215 item 4: a 200 KB print must reach the session as ordered
+# 64,000-char chunks instead of dropping the whole POST with a 422.
+def test_browser_terminal_accepts_chunked_output_in_order(tmp_path: Path) -> None:
+    manager = NotebookSessionManager(cwd=tmp_path)
+    session = manager.create(mode="browser")
+    release_response = threading.Event()
+    chunks = ["a" * 64_000, "b" * 64_000, "c" * 64_000, "d" * 8_000]
+
+    def serve_terminal() -> None:
+        request = session.next_browser_request(timeout=1)
+        assert request is not None
+        request_id = request.pop("id")
+        assert request == {"action": "execute_terminal", "command": "pip list"}
+        for chunk in chunks:
+            session.submit_browser_output(request_id, stream="stdout", text=chunk)
+        assert release_response.wait(timeout=2)
+        session.submit_browser_response(
+            request_id,
+            {"ok": True, "stdout": "".join(chunks), "stderr": ""},
+        )
+
+    worker = threading.Thread(target=serve_terminal)
+    worker.start()
+    try:
+        events = session.stream_terminal(cell_id="packages", source="!pip list")
+        first = next(events)
+        assert first == {"type": "output", "stream": "stdout", "text": chunks[0]}
+        release_response.set()
+        remaining = list(events)
+        outputs = [
+            event
+            for event in [first, *remaining]
+            if event.get("type") == "output" and event.get("stream") == "stdout"
+        ]
+        assert "".join(event["text"] for event in outputs) == "".join(chunks)
+        assert remaining[-1]["ok"] is True
+        # The session survives the large output.
+        assert manager.get(session.id) is session
+    finally:
+        release_response.set()
+        manager.close_all()
+        worker.join(timeout=2)
+
+
+def test_browser_output_post_rejects_single_oversized_text(tmp_path: Path) -> None:
+    app = create_app(cwd=tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        session = client.post("/api/notebook/sessions", json={"mode": "browser"}).json()
+        session_id = session["sessionId"]
+        oversized = client.post(
+            f"/api/notebook/sessions/{session_id}/bridge/output",
+            json={"requestId": "req-1", "stream": "stdout", "text": "x" * 64_001},
+        )
+        assert oversized.status_code == 422
+        # At the limit the payload itself is valid: the handler then rejects
+        # the unknown request id (400), which is not a validation failure.
+        at_limit = client.post(
+            f"/api/notebook/sessions/{session_id}/bridge/output",
+            json={"requestId": "req-1", "stream": "stdout", "text": "x" * 64_000},
+        )
+        assert at_limit.status_code == 400
+
+
+# Audit #215 item 16: a close_all() that runs while a session is still being
+# constructed must close the new session instead of missing it.
+def test_notebook_session_create_close_all_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kedi
+
+    manager = NotebookSessionManager(cwd=tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    real_interactive = kedi.interactive
+
+    def slow_interactive(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        assert release.wait(timeout=10)
+        return real_interactive(*args, **kwargs)
+
+    monkeypatch.setattr(kedi, "interactive", slow_interactive)
+    created: list[Any] = []
+    worker = threading.Thread(target=lambda: created.append(manager.create(mode="browser")))
+    worker.start()
+    assert started.wait(timeout=10)
+    closer = threading.Thread(target=manager.close_all)
+    closer.start()
+    time.sleep(0.5)
+    release.set()
+    worker.join(timeout=10)
+    closer.join(timeout=10)
+    assert len(created) == 1
+    session = created[0]
+    assert session._closed
+    with pytest.raises(KeyError):
+        manager.get(session.id)
+
+
+# Audit #215 item 16: a pip/python command with shell syntax must run through
+# the shell instead of silently dropping the pipe.
+def test_notebook_host_terminal_pipes_through_shell(tmp_path: Path) -> None:
+    # Pipelines preserve the selected Python environment without loading login profiles.
+    manager = NotebookSessionManager(
+        cwd=tmp_path,
+        explicit_pythons=[sys.executable],
+        host_environment=_PASSTHROUGH_HOST_ENVIRONMENT,
+    )
+    session = manager.create(mode="host", python_id=manager.pythons[0].id)
+    try:
+        events = list(
+            session.stream_terminal(
+                cell_id="terminal",
+                source=(
+                    '!python -c "import sys; print(sys.prefix); '
+                    "print('hello'); print('goodbye')\" | grep -v hello"
+                ),
+            )
+        )
+    finally:
+        manager.close_all()
+
+    outputs = [event for event in events if event.get("type") == "output"]
+    # No profile output may leak in before the command's own output.
+    assert "".join(event["text"] for event in outputs) == f"{sys.prefix}\ngoodbye\n"
+    result = [event for event in events if event.get("type") == "result"][0]
+    assert result["ok"] is True
