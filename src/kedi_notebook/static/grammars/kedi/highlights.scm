@@ -93,6 +93,8 @@
 (package_field value: (package_plain_value) @string)
 (package_python_dependencies "python_dependencies" @property)
 (package_dependency value: (package_dependency_value) @string)
+(package_adapters "adapters" @property)
+(package_adapter name: (identifier) @namespace)
 (module_import module: (module_path) @namespace)
 (module_import_name name: (identifier) @variable)
 (module_export_name name: (identifier) @variable)
