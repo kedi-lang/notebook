@@ -92,6 +92,7 @@
 (package_field name: (identifier) @property)
 (package_field value: (package_plain_value) @string)
 (package_python_dependencies "python_dependencies" @property)
+(package_kedi_dependencies "kedi_dependencies" @property)
 (package_dependency value: (package_dependency_value) @string)
 (package_adapters "adapters" @property)
 (package_adapter name: (identifier) @namespace)

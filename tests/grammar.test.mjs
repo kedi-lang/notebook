@@ -144,3 +144,35 @@ test("shipped WASM parses and highlights references", async () => {
     parser.delete();
   }
 });
+
+test("shipped WASM parses and highlights a package's Kedi dependencies", async () => {
+  await Parser.init({
+    locateFile: () => fileURLToPath(new URL("vendor/web-tree-sitter.wasm", staticRoot)),
+  });
+  const language = await Language.load(
+    fileURLToPath(new URL("grammars/kedi/tree-sitter-kedi.wasm", staticRoot)),
+  );
+  const parser = new Parser();
+  parser.setLanguage(language);
+  const query = new Query(
+    language,
+    await readFile(new URL("grammars/kedi/highlights.scm", staticRoot), "utf8"),
+  );
+  const tree = parser.parse(
+    "> package: release_tools:\n" +
+    "  source: src/release_tools\n" +
+    "  kedi_dependencies:\n" +
+    "    hermes>=0.1\n",
+  );
+  try {
+    assert.equal(tree.rootNode.hasError, false);
+    const properties = query.captures(tree.rootNode)
+      .filter((item) => item.name === "property")
+      .map((item) => item.node.text);
+    assert.ok(properties.includes("kedi_dependencies"));
+  } finally {
+    tree.delete();
+    query.delete();
+    parser.delete();
+  }
+});
